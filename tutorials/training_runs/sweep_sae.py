@@ -24,8 +24,8 @@ wandb.login()
 def run_exp():
     wandb.init(project="sae_lens_tutorial")
     params = wandb.config
-    total_training_steps = 60_000  # probably we should do more
-    batch_size = 2048
+    total_training_steps = 30_000
+    batch_size = 4096
     total_training_tokens = total_training_steps * batch_size
 
     lr_warm_up_steps = 0
@@ -63,9 +63,9 @@ def run_exp():
         l1_warm_up_steps=l1_warm_up_steps,  # this can help avoid too many dead features initially.
         lp_norm=params["lp_norm"],  # the L1 penalty (and not a Lp for p < 1)
         train_batch_size_tokens=batch_size,
-        context_size=128,  # will control the lenght of the prompts we feed to the model. Larger is better but slower. so for the tutorial we'll use a short one.
+        context_size=512,  # will control the lenght of the prompts we feed to the model. Larger is better but slower. so for the tutorial we'll use a short one.
         # Activation Store Parameters
-        n_batches_in_buffer=16,  # controls how many activations we store / shuffle.
+        n_batches_in_buffer=64,  # controls how many activations we store / shuffle.
         act_store_device='cpu',
         training_tokens=total_training_tokens,  # 100 million tokens is quite a few, but we want to see good stats. Get a coffee, come back.
         store_batch_size_prompts=16,
