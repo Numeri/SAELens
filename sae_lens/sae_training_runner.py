@@ -142,20 +142,22 @@ class SAETrainingRunner:
             )  # type: ignore
 
     def run_trainer_with_interruption_handling(self, trainer: SAETrainer):
-        try:
-            # signal handlers (if preempted)
-            signal.signal(signal.SIGINT, interrupt_callback)
-            signal.signal(signal.SIGTERM, interrupt_callback)
+        sae = trainer.fit()
 
-            # train SAE
-            sae = trainer.fit()
+        # try:
+        #     # signal handlers (if preempted)
+        #     signal.signal(signal.SIGINT, interrupt_callback)
+        #     signal.signal(signal.SIGTERM, interrupt_callback)
 
-        except (KeyboardInterrupt, InterruptedException):
-            print("interrupted, saving progress")
-            checkpoint_name = trainer.n_training_tokens
-            self.save_checkpoint(trainer, checkpoint_name=checkpoint_name)
-            print("done saving")
-            raise
+        #     # train SAE
+        #     sae = trainer.fit()
+
+        # except (KeyboardInterrupt, InterruptedException):
+        #     print("interrupted, saving progress")
+        #     checkpoint_name = trainer.n_training_tokens
+        #     self.save_checkpoint(trainer, checkpoint_name=checkpoint_name)
+        #     print("done saving")
+        #     raise
 
         return sae
 
