@@ -107,4 +107,4 @@ sweep_config = {
 
 # sweep_id = wandb.sweep(sweep=sweep_config, project="sae_lens_tutorial")
 sweep_id = "ovga6qzn"
-wandb.agent(sweep_id=sweep_id, function=run_exp, count=300)
+wandb.agent(project="sae_lens_tutorial", sweep_id=sweep_id, function=run_exp, count=300)
