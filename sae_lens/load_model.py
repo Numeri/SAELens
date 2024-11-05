@@ -1,7 +1,7 @@
 from typing import Any, cast
 
 import torch
-from transformer_lens import HookedTransformer
+from transformer_lens import HookedTransformer, HookedEncoder
 from transformer_lens.hook_points import HookedRootModule
 
 
@@ -39,6 +39,10 @@ def load_model(
             HookedMamba.from_pretrained(
                 model_name, device=cast(Any, device), **model_from_pretrained_kwargs
             ),
+        )
+    elif model_class_name == "HookedEncoder":
+        return HookedEncoder.from_pretrained(
+            model_name=model_name, device=device, **model_from_pretrained_kwargs,
         )
     else:  # pragma: no cover
         raise ValueError(f"Unknown model class: {model_class_name}")
