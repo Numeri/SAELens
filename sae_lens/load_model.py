@@ -1,7 +1,7 @@
 from typing import Any, Literal, cast
 
 import torch
-from transformer_lens import HookedTransformer
+from transformer_lens import HookedTransformer, HookedEncoder
 from transformer_lens.hook_points import HookedRootModule, HookPoint
 from transformer_lens.HookedTransformer import Loss, Output
 from transformer_lens.utils import (
@@ -55,6 +55,10 @@ def load_model(
         ).to(device)
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         return HookedProxyLM(hf_model, tokenizer)
+    if model_class_name == "HookedEncoder":
+        return HookedEncoder.from_pretrained(
+            model_name=model_name, device=device, **model_from_pretrained_kwargs,
+        )
 
     # pragma: no cover
     raise ValueError(f"Unknown model class: {model_class_name}")

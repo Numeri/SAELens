@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from datasets import Dataset, DatasetDict, IterableDataset, load_dataset
 from huggingface_hub import hf_hub_download
-from huggingface_hub.utils import HfHubHTTPError
+from huggingface_hub.utils import HfHubHTTPError, HFValidationError
 from jaxtyping import Float
 from requests import HTTPError
 from safetensors.torch import save_file
@@ -522,13 +522,24 @@ class ActivationsStore:
 
         n_batches, n_context = layerwise_activations.shape[:2]
 
+        activation_shape = layerwise_activations[self.hook_name].shape
+        if (
+            len(activation_shape) == 2
+            and activation_shape[0] == n_batches
+            and activation_shape[1] == self.d_in
+        ):
+            # If we have only one token instead of the whole context
+            # such as with encoder class tokens
+            n_context = 1
+
         stacked_activations = torch.zeros((n_batches, n_context, 1, self.d_in))
 
         if self.hook_head_index is not None:
             stacked_activations[:, :, 0] = layerwise_activations[
                 :, :, self.hook_head_index
             ]
-        elif layerwise_activations.ndim > 3:  # if we have a head dimension
+        elif len(activation_shape) > 3:
+            # if we have a head dimension
             try:
                 stacked_activations[:, :, 0] = layerwise_activations.view(
                     n_batches, n_context, -1
@@ -539,6 +550,9 @@ class ActivationsStore:
                 stacked_activations[:, :, 0] = layerwise_activations.reshape(
                     n_batches, n_context, -1
                 )
+        elif len(activation_shape) == 2 and n_context == 1:
+            # If we have a single token
+            stacked_activations[:, 0, 0] = layerwise_activations
         else:
             stacked_activations[:, :, 0] = layerwise_activations
 
@@ -738,7 +752,7 @@ def validate_pretokenized_dataset_tokenizer(
         tokenization_cfg_path = hf_hub_download(
             dataset_path, "sae_lens.json", repo_type="dataset"
         )
-    except HfHubHTTPError:
+    except (HfHubHTTPError, HFValidationError):
         return
     if tokenization_cfg_path is None:
         return

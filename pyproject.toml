@@ -18,8 +18,9 @@ keywords = [
 classifiers = ["Topic :: Scientific/Engineering :: Artificial Intelligence"]
 
 [tool.poetry.dependencies]
-python = "^3.10"
-transformer-lens = "^2.0.0"
+python = "^3.11"
+transformer-lens = { git = "https://github.com/Numeri/TransformerLens.git", branch = "numeri/infoxlm" }
+sentencepiece = ">0.1.99"
 transformers = "^4.38.1"
 plotly = "^5.19.0"
 plotly-express = "^0.4.1"
@@ -32,7 +33,9 @@ safetensors = "^0.4.2"
 typer = "^0.12.3"
 mamba-lens = { version = "^0.0.4", optional = true }
 pyzmq = "26.0.0"
-automated-interpretability = ">=0.0.5,<1.0.0"
+automated-interpretability = [
+    { git = "https://github.com/Numeri/automated-interpretability.git", branch = "numeri/update-numpy" },
+]
 python-dotenv = "^1.0.1"
 pyyaml = "^6.0.1"
 pytest-profiling = "^1.7.0"
