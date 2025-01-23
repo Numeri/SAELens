@@ -522,7 +522,7 @@ class ActivationsStore:
 
         n_batches, n_context = layerwise_activations.shape[:2]
 
-        activation_shape = layerwise_activations[self.hook_name].shape
+        activation_shape = layerwise_activations.shape
         if (
             len(activation_shape) == 2
             and activation_shape[0] == n_batches
