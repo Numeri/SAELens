@@ -508,6 +508,10 @@ class ActivationsStore:
             autocast_if_enabled = contextlib.nullcontext()
 
         with autocast_if_enabled:
+            if self.model.tokenizer.pad_token is not None:
+                pad_id = self.model.tokenizer.convert_tokens_to_ids(self.model.tokenizer.pad_token)
+                max_pad_idx = (batch_tokens == pad_id).int().argmax(dim=1).max()
+                batch_tokens = batch_tokens[:, :max_pad_idx]
             layerwise_activations_cache = self.model.run_with_cache(
                 batch_tokens,
                 names_filter=[self.hook_name],

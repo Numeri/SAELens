@@ -266,6 +266,7 @@ def test_run_empty_evals(
         n_eval_sparsity_variance_batches=0,
         compute_ce_loss=False,
         compute_kl=False,
+        compute_mse_loss=False,
         compute_l2_norms=False,
         compute_sparsity_metrics=False,
         compute_variance_metrics=False,

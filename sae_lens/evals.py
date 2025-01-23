@@ -59,6 +59,7 @@ class EvalConfig:
     n_eval_reconstruction_batches: int = 10
     compute_kl: bool = False
     compute_ce_loss: bool = False
+    compute_mse_loss: bool = False
 
     # Sparsity and variance metrics
     n_eval_sparsity_variance_batches: int = 1
@@ -88,6 +89,7 @@ def get_eval_everything_config(
         n_eval_reconstruction_batches=n_eval_reconstruction_batches,
         compute_kl=True,
         compute_ce_loss=True,
+        compute_mse_loss=True,
         compute_l2_norms=True,
         n_eval_sparsity_variance_batches=n_eval_sparsity_variance_batches,
         compute_sparsity_metrics=True,
@@ -129,7 +131,7 @@ def run_evals(
         "token_stats": {},
     }
 
-    if eval_config.compute_kl or eval_config.compute_ce_loss:
+    if eval_config.compute_kl or eval_config.compute_ce_loss or eval_config.compute_mse_loss:
         assert eval_config.n_eval_reconstruction_batches > 0
         reconstruction_metrics = get_downstream_reconstruction_metrics(
             sae,
@@ -165,6 +167,14 @@ def run_evals(
                     "ce_loss_without_sae": reconstruction_metrics[
                         "ce_loss_without_sae"
                     ],
+                }
+            )
+
+        if eval_config.compute_mse_loss:
+            all_metrics["reconstruction_quality"].update(
+                {
+                    "mse_loss_with_sae": reconstruction_metrics["mse_loss_with_sae"],
+                    "mse_loss_with_ablation": reconstruction_metrics["mse_loss_with_ablation"],
                 }
             )
 
@@ -290,6 +300,7 @@ def get_downstream_reconstruction_metrics(
     activation_store: ActivationsStore,
     compute_kl: bool,
     compute_ce_loss: bool,
+    compute_mse_loss: bool,
     n_batches: int,
     eval_batch_size_prompts: int,
     ignore_tokens: set[int | None] = set(),
@@ -303,6 +314,9 @@ def get_downstream_reconstruction_metrics(
         metrics_dict["ce_loss_with_sae"] = []
         metrics_dict["ce_loss_without_sae"] = []
         metrics_dict["ce_loss_with_ablation"] = []
+    if compute_mse_loss:
+        metrics_dict["mse_loss_with_sae"] = []
+        metrics_dict["mse_loss_with_ablation"] = []
 
     batch_iter = range(n_batches)
     if verbose:
@@ -317,6 +331,7 @@ def get_downstream_reconstruction_metrics(
             activation_store,
             compute_kl=compute_kl,
             compute_ce_loss=compute_ce_loss,
+            compute_mse_loss=compute_mse_loss,
             ignore_tokens=ignore_tokens,
         ).items():
             if len(ignore_tokens) > 0:
@@ -344,10 +359,15 @@ def get_downstream_reconstruction_metrics(
             metrics["kl_div_with_ablation"] - metrics["kl_div_with_sae"]
         ) / metrics["kl_div_with_ablation"]
 
-    if compute_ce_loss:
+    if compute_ce_loss and "ce_loss_without_sae" in metrics:
         metrics["ce_loss_score"] = (
             metrics["ce_loss_with_ablation"] - metrics["ce_loss_with_sae"]
         ) / (metrics["ce_loss_with_ablation"] - metrics["ce_loss_without_sae"])
+
+    if compute_mse_loss:
+        metrics["mse_loss_score"] = (
+            metrics["mse_loss_with_ablation"] - metrics["mse_loss_with_sae"]
+        ) / metrics["mse_loss_with_ablation"]
 
     return metrics
 
@@ -538,6 +558,7 @@ def get_recons_loss(
     activation_store: ActivationsStore,
     compute_kl: bool,
     compute_ce_loss: bool,
+    compute_mse_loss: bool,
     ignore_tokens: set[int | None] = set(),
     model_kwargs: Mapping[str, Any] = {},
 ) -> dict[str, Any]:
@@ -672,16 +693,29 @@ def get_recons_loss(
         kl_div = original_probs * (log_original_probs - log_new_probs)
         return kl_div.sum(dim=-1)
 
+    def mse(original_logits: torch.Tensor, new_logits: torch.Tensor):
+        return (original_logits - new_logits).pow(2).mean(dim=-1)
+
     if compute_kl:
         recons_kl_div = kl(original_logits, recons_logits)
         zero_abl_kl_div = kl(original_logits, zero_abl_logits)
         metrics["kl_div_with_sae"] = recons_kl_div
         metrics["kl_div_with_ablation"] = zero_abl_kl_div
 
-    if compute_ce_loss:
+    losses_not_none = (
+        recons_ce_loss is not None
+        and original_ce_loss is not None
+        and zero_abl_ce_loss is not None
+    )
+
+    if compute_ce_loss and losses_not_none:
         metrics["ce_loss_with_sae"] = recons_ce_loss
         metrics["ce_loss_without_sae"] = original_ce_loss
         metrics["ce_loss_with_ablation"] = zero_abl_ce_loss
+
+    if compute_mse_loss:
+        metrics["mse_loss_with_sae"] = mse(original_logits, recons_logits)
+        metrics["mse_loss_with_ablation"] = mse(original_logits, zero_abl_logits)
 
     return metrics
 

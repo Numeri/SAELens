@@ -148,6 +148,7 @@ class SAETrainer:
             n_eval_reconstruction_batches=self.cfg.n_eval_batches,
             n_eval_sparsity_variance_batches=self.cfg.n_eval_batches,
             compute_ce_loss=True,
+            compute_mse_loss=True,
             compute_l2_norms=True,
             compute_sparsity_metrics=True,
             compute_variance_metrics=True,
