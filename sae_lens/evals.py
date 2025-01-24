@@ -139,6 +139,7 @@ def run_evals(
             activation_store,
             compute_kl=eval_config.compute_kl,
             compute_ce_loss=eval_config.compute_ce_loss,
+            compute_mse_loss=eval_config.compute_mse_loss,
             n_batches=eval_config.n_eval_reconstruction_batches,
             eval_batch_size_prompts=actual_batch_size,
             ignore_tokens=ignore_tokens,
@@ -352,7 +353,10 @@ def get_downstream_reconstruction_metrics(
 
     metrics: dict[str, float] = {}
     for metric_name, metric_values in metrics_dict.items():
-        metrics[f"{metric_name}"] = torch.cat(metric_values).mean().item()
+        if len(metric_values) == 0:
+            metrics[f"{metric_name}"] = math.nan
+        else:
+            metrics[f"{metric_name}"] = torch.cat(metric_values).mean().item()
 
     if compute_kl:
         metrics["kl_div_score"] = (
@@ -419,6 +423,15 @@ def get_sparsity_and_variance_metrics(
     for _ in batch_iter:
         batch_tokens = activation_store.get_batch_tokens(eval_batch_size_prompts)
 
+        # get cache
+        original_logits, cache = model.run_with_cache(
+            batch_tokens,
+            prepend_bos=False,
+            names_filter=[hook_name],
+            stop_at_layer=sae.cfg.hook_layer + 1,
+            **model_kwargs,
+        )
+
         if len(ignore_tokens) > 0:
             mask = torch.logical_not(
                 torch.any(
@@ -428,18 +441,11 @@ def get_sparsity_and_variance_metrics(
                     dim=0,
                 )
             )
+        elif original_logits.dim() == 2:
+            mask = torch.ones(batch_tokens.shape[:1], dtype=torch.bool).to(batch_tokens.device)
         else:
             mask = torch.ones_like(batch_tokens, dtype=torch.bool)
         flattened_mask = mask.flatten()
-
-        # get cache
-        _, cache = model.run_with_cache(
-            batch_tokens,
-            prepend_bos=False,
-            names_filter=[hook_name],
-            stop_at_layer=sae.cfg.hook_layer + 1,
-            **model_kwargs,
-        )
 
         # we would include hook z, except that we now have base SAE's
         # which will do their own reshaping for hook z.
@@ -463,11 +469,16 @@ def get_sparsity_and_variance_metrics(
         if activation_store.normalize_activations == "expected_average_only_in":
             sae_out = activation_store.unscale(sae_out)
 
-        flattened_sae_input = einops.rearrange(original_act, "b ctx d -> (b ctx) d")
-        flattened_sae_feature_acts = einops.rearrange(
-            sae_feature_activations, "b ctx d -> (b ctx) d"
-        )
-        flattened_sae_out = einops.rearrange(sae_out, "b ctx d -> (b ctx) d")
+        if original_act.dim() == 3:
+            flattened_sae_input = einops.rearrange(original_act, "b ctx d -> (b ctx) d")
+            flattened_sae_feature_acts = einops.rearrange(
+                sae_feature_activations, "b ctx d -> (b ctx) d"
+            )
+            flattened_sae_out = einops.rearrange(sae_out, "b ctx d -> (b ctx) d")
+        else:
+            flattened_sae_input = original_act
+            flattened_sae_feature_acts = sae_feature_activations
+            flattened_sae_out = sae_out
 
         # TODO: Clean this up.
         # apply mask
@@ -576,6 +587,8 @@ def get_recons_loss(
                 dim=0,
             )
         )
+    elif original_logits.dim() == 2:
+        mask = torch.ones(batch_tokens.shape[:1], dtype=torch.bool).to(batch_tokens.device)
     else:
         mask = torch.ones_like(batch_tokens, dtype=torch.bool)
 
