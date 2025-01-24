@@ -1,5 +1,6 @@
 import json
 import re
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Protocol, Tuple
 
 import numpy as np
@@ -7,24 +8,41 @@ import torch
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import EntryNotFoundError
 from safetensors import safe_open
+from safetensors.torch import load_file
+
+from sae_lens import logger
+from sae_lens.config import DTYPE_MAP
+from sae_lens.toolkit.pretrained_saes_directory import (
+    PretrainedSAELookup,
+    get_pretrained_saes_directory,
+    get_repo_id_and_folder_name,
+)
 
 
-# loaders take in a repo_id, folder_name, device, and whether to force download, and returns a tuple of config and state_dict
+# loaders take in a release, sae_id, device, and whether to force download, and returns a tuple of config, state_dict, and log sparsity
 class PretrainedSaeLoader(Protocol):
-
     def __call__(
         self,
-        repo_id: str,
-        folder_name: str,
+        release: str,
+        sae_id: str,
         device: str | torch.device | None = None,
         force_download: bool = False,
         cfg_overrides: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, torch.Tensor], Optional[torch.Tensor]]: ...
 
 
+@dataclass
+class SAEConfigLoadOptions:
+    device: Optional[str] = None
+    force_download: bool = False
+    d_sae_override: Optional[int] = None
+    layer_override: Optional[int] = None
+    cfg_overrides: Optional[Dict[str, Any]] = field(default_factory=dict)
+
+
 def sae_lens_loader(
-    repo_id: str,
-    folder_name: str,
+    release: str,
+    sae_id: str,
     device: str = "cpu",
     force_download: bool = False,
     cfg_overrides: Optional[dict[str, Any]] = None,
@@ -32,17 +50,13 @@ def sae_lens_loader(
     """
     Get's SAEs from HF, loads them.
     """
-    # Get the config
-    cfg_dict = get_sae_config_from_hf(
-        repo_id,
-        folder_name,
-        force_download,
+    options = SAEConfigLoadOptions(
+        device=device,
+        force_download=force_download,
+        cfg_overrides=cfg_overrides,
     )
-    # Apply overrides if provided
-    if cfg_overrides is not None:
-        cfg_dict.update(cfg_overrides)
-    cfg_dict["device"] = device
-    cfg_dict = handle_config_defaulting(cfg_dict)
+    cfg_dict = get_sae_config(release, sae_id=sae_id, options=options)
+    repo_id, folder_name = get_repo_id_and_folder_name(release, sae_id=sae_id)
 
     weights_filename = f"{folder_name}/sae_weights.safetensors"
     sae_path = hf_hub_download(
@@ -77,7 +91,7 @@ def sae_lens_loader(
 def get_sae_config_from_hf(
     repo_id: str,
     folder_name: str,
-    force_download: bool = False,
+    options: SAEConfigLoadOptions,
 ) -> Dict[str, Any]:
     """
     Retrieve the configuration for a Sparse Autoencoder (SAE) from a Hugging Face repository.
@@ -93,17 +107,19 @@ def get_sae_config_from_hf(
     """
     cfg_filename = f"{folder_name}/cfg.json"
     cfg_path = hf_hub_download(
-        repo_id=repo_id, filename=cfg_filename, force_download=force_download
+        repo_id=repo_id, filename=cfg_filename, force_download=options.force_download
     )
 
-    with open(cfg_path, "r") as f:
+    with open(cfg_path) as f:
         cfg_dict = json.load(f)
+
+    if options.device is not None:
+        cfg_dict["device"] = options.device
 
     return cfg_dict
 
 
 def handle_config_defaulting(cfg_dict: dict[str, Any]) -> dict[str, Any]:
-
     # Set default values for backwards compatibility
     cfg_dict.setdefault("prepend_bos", True)
     cfg_dict.setdefault("dataset_trust_remote_code", True)
@@ -112,7 +128,7 @@ def handle_config_defaulting(cfg_dict: dict[str, Any]) -> dict[str, Any]:
     cfg_dict.setdefault("sae_lens_training_version", None)
     cfg_dict.setdefault("activation_fn_str", cfg_dict.get("activation_fn", "relu"))
     cfg_dict.setdefault("architecture", "standard")
-    cfg_dict.setdefault("neuronpedia", None)
+    cfg_dict.setdefault("neuronpedia_id", None)
 
     if "normalize_activations" in cfg_dict and isinstance(
         cfg_dict["normalize_activations"], bool
@@ -130,78 +146,17 @@ def handle_config_defaulting(cfg_dict: dict[str, Any]) -> dict[str, Any]:
     return cfg_dict
 
 
-def connor_rob_hook_z_loader(
-    repo_id: str,
-    folder_name: str,
-    device: Optional[str] = None,
-    force_download: bool = False,
-    cfg_overrides: Optional[dict[str, Any]] = None,
-) -> tuple[dict[str, Any], dict[str, torch.Tensor], None]:
-
-    file_path = hf_hub_download(
-        repo_id=repo_id, filename=folder_name, force_download=force_download
-    )
+def get_connor_rob_hook_z_config(
+    repo_id: str, folder_name: str, options: SAEConfigLoadOptions
+) -> dict[str, Any]:
+    device = options.device
     config_path = folder_name.split(".pt")[0] + "_cfg.json"
     config_path = hf_hub_download(repo_id, config_path)
-    old_cfg_dict = json.load(open(config_path, "r"))
 
-    weights = torch.load(file_path, map_location=device)
-    # weights_filename = f"{folder_name}/sae_weights.safetensors"
-    # sae_path = hf_hub_download(
-    #     repo_id=repo_id, filename=weights_filename, force_download=force_download
-    # )
-    # if device is None:
-    #     device = "cuda" if torch.cuda.is_available() else "cpu"
+    with open(config_path) as config_file:
+        old_cfg_dict = json.load(config_file)
 
-    # return load_pretrained_sae_lens_sae_components(cfg_path, sae_path, device)
-
-    # old_cfg_dict = {
-    #     "seed": 49,
-    #     "batch_size": 4096,
-    #     "buffer_mult": 384,
-    #     "lr": 0.0012,
-    #     "num_tokens": 2000000000,
-    #     "l1_coeff": 1.8,
-    #     "beta1": 0.9,
-    #     "beta2": 0.99,
-    #     "dict_mult": 32,
-    #     "seq_len": 128,
-    #     "enc_dtype": "fp32",
-    #     "model_name": "gpt2-small",
-    #     "site": "z",
-    #     "layer": 0,
-    #     "device": "cuda",
-    #     "reinit": "reinit",
-    #     "head": "cat",
-    #     "concat_heads": True,
-    #     "resample_scheme": "anthropic",
-    #     "anthropic_neuron_resample_scale": 0.2,
-    #     "dead_direction_cutoff": 1e-06,
-    #     "re_init_every": 25000,
-    #     "anthropic_resample_last": 12500,
-    #     "resample_factor": 0.01,
-    #     "num_resamples": 4,
-    #     "wandb_project_name": "gpt2-L0-20240117",
-    #     "wandb_entity": "ckkissane",
-    #     "save_state_dict_every": 50000,
-    #     "b_dec_init": "zeros",
-    #     "sched_type": "cosine_warmup",
-    #     "sched_epochs": 1000,
-    #     "sched_lr_factor": 0.1,
-    #     "sched_warmup_epochs": 1000,
-    #     "sched_finish": True,
-    #     "anthropic_resample_batches": 100,
-    #     "eval_every": 1000,
-    #     "model_batch_size": 512,
-    #     "buffer_size": 1572864,
-    #     "buffer_batches": 12288,
-    #     "act_name": "blocks.0.attn.hook_z",
-    #     "act_size": 768,
-    #     "dict_size": 24576,
-    #     "name": "gpt2-small_0_24576_z",
-    # }
-
-    cfg_dict = {
+    return {
         "architecture": "standard",
         "d_in": old_cfg_dict["act_size"],
         "d_sae": old_cfg_dict["dict_size"],
@@ -222,6 +177,31 @@ def connor_rob_hook_z_loader(
         "dataset_trust_remote_code": True,
     }
 
+
+def connor_rob_hook_z_loader(
+    release: str,
+    sae_id: str,
+    device: Optional[str] = None,
+    force_download: bool = False,
+    cfg_overrides: Optional[dict[str, Any]] = None,  # noqa: ARG001
+) -> tuple[dict[str, Any], dict[str, torch.Tensor], None]:
+    options = SAEConfigLoadOptions(
+        device=device,
+        force_download=force_download,
+    )
+    cfg_dict = get_sae_config(
+        release,
+        sae_id=sae_id,
+        options=options,
+    )
+
+    repo_id, folder_name = get_repo_id_and_folder_name(release, sae_id=sae_id)
+
+    file_path = hf_hub_download(
+        repo_id=repo_id, filename=folder_name, force_download=force_download
+    )
+    weights = torch.load(file_path, map_location=device)
+
     return cfg_dict, weights, None
 
 
@@ -229,15 +209,17 @@ def read_sae_from_disk(
     cfg_dict: dict[str, Any],
     weight_path: str,
     device: str = "cpu",
-    dtype: torch.dtype = torch.float32,
+    dtype: Optional[torch.dtype] = None,
 ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
     """
     Given a loaded dictionary and a path to a weight file, load the weights and return the state_dict.
     """
+    if dtype is None:
+        dtype = DTYPE_MAP[cfg_dict["dtype"]]
 
     state_dict = {}
     with safe_open(weight_path, framework="pt", device=device) as f:  # type: ignore
-        for k in f.keys():
+        for k in f.keys():  # noqa: SIM118
             state_dict[k] = f.get_tensor(k).to(dtype=dtype)
 
     # if bool and True, then it's the April update method of normalizing activations and hasn't been folded in.
@@ -266,8 +248,7 @@ def read_sae_from_disk(
 def get_gemma_2_config(
     repo_id: str,
     folder_name: str,
-    d_sae_override: Optional[int] = None,
-    layer_override: Optional[int] = None,
+    options: SAEConfigLoadOptions,
 ) -> Dict[str, Any]:
     # Detect width from folder_name
     width_map = {
@@ -283,6 +264,7 @@ def get_gemma_2_config(
     d_sae = next(
         (width for key, width in width_map.items() if key in folder_name), None
     )
+    d_sae_override = options.d_sae_override
     if d_sae is None:
         if not d_sae_override:
             raise ValueError("Width not found in folder_name and no override provided.")
@@ -290,7 +272,7 @@ def get_gemma_2_config(
 
     # Detect layer from folder_name
     match = re.search(r"layer_(\d+)", folder_name)
-    layer = int(match.group(1)) if match else layer_override
+    layer = int(match.group(1)) if match else options.layer_override
     if layer is None:
         if "embedding" in folder_name:
             layer = 0
@@ -329,7 +311,7 @@ def get_gemma_2_config(
     else:
         raise ValueError("Hook name not found in folder_name.")
 
-    return {
+    cfg = {
         "architecture": "jumprelu",
         "d_in": d_in,
         "d_sae": d_sae,
@@ -348,11 +330,15 @@ def get_gemma_2_config(
         "apply_b_dec_to_input": False,
         "normalize_activations": None,
     }
+    if options.device is not None:
+        cfg["device"] = options.device
+
+    return cfg
 
 
 def gemma_2_sae_loader(
-    repo_id: str,
-    folder_name: str,
+    release: str,
+    sae_id: str,
     device: str = "cpu",
     force_download: bool = False,
     cfg_overrides: Optional[Dict[str, Any]] = None,
@@ -362,12 +348,23 @@ def gemma_2_sae_loader(
     """
     Custom loader for Gemma 2 SAEs.
     """
-    cfg_dict = get_gemma_2_config(repo_id, folder_name, d_sae_override, layer_override)
+    options = SAEConfigLoadOptions(
+        device=device,
+        d_sae_override=d_sae_override,
+        layer_override=layer_override,
+    )
+    cfg_dict = get_sae_config(
+        release,
+        sae_id=sae_id,
+        options=options,
+    )
     cfg_dict["device"] = device
 
     # Apply overrides if provided
     if cfg_overrides is not None:
         cfg_dict.update(cfg_overrides)
+
+    repo_id, folder_name = get_repo_id_and_folder_name(release, sae_id=sae_id)
 
     # Download the SAE weights
     sae_path = hf_hub_download(
@@ -380,7 +377,7 @@ def gemma_2_sae_loader(
     # Load and convert the weights
     state_dict = {}
     with np.load(sae_path) as data:
-        for key in data.keys():
+        for key in data:
             state_dict_key = "W_" + key[2:] if key.startswith("w_") else key
             state_dict[state_dict_key] = (
                 torch.tensor(data[key]).to(dtype=torch.float32).to(device)
@@ -406,17 +403,149 @@ def gemma_2_sae_loader(
 
     # if it is an embedding SAE, then we need to adjust for the scale of d_model because of how they trained it
     if "embedding" in folder_name:
-        print("Adjusting for d_model in embedding SAE")
+        logger.debug("Adjusting for d_model in embedding SAE")
         state_dict["W_enc"].data = state_dict["W_enc"].data / np.sqrt(cfg_dict["d_in"])
         state_dict["W_dec"].data = state_dict["W_dec"].data * np.sqrt(cfg_dict["d_in"])
 
     return cfg_dict, state_dict, log_sparsity
 
 
-def get_dictionary_learning_config_1(config: dict[str, Any]) -> dict[str, Any]:
+def get_llama_scope_config(
+    repo_id: str,
+    folder_name: str,
+    options: SAEConfigLoadOptions,  # noqa: ARG001
+) -> Dict[str, Any]:
+    # Llama Scope SAEs
+    # repo_id: fnlp/Llama3_1-8B-Base-LX{sublayer}-{exp_factor}x
+    # folder_name: Llama3_1-8B-Base-L{layer}{sublayer}-{exp_factor}x
+    config_path = folder_name + "/hyperparams.json"
+    config_path = hf_hub_download(repo_id, config_path)
+
+    with open(config_path) as f:
+        old_cfg_dict = json.load(f)
+
+    # Model specific parameters
+    model_name, d_in = "meta-llama/Llama-3.1-8B", old_cfg_dict["d_model"]
+
+    return {
+        "architecture": "jumprelu",
+        "jump_relu_threshold": old_cfg_dict["jump_relu_threshold"],
+        # We use a scalar jump_relu_threshold for all features
+        # This is different from Gemma Scope JumpReLU SAEs.
+        "d_in": d_in,
+        "d_sae": old_cfg_dict["d_sae"],
+        "dtype": "bfloat16",
+        "model_name": model_name,
+        "hook_name": old_cfg_dict["hook_point_in"],
+        "hook_layer": int(old_cfg_dict["hook_point_in"].split(".")[1]),
+        "hook_head_index": None,
+        "activation_fn_str": "relu",
+        "finetuning_scaling_factor": False,
+        "sae_lens_training_version": None,
+        "prepend_bos": True,
+        "dataset_path": "cerebras/SlimPajama-627B",
+        "context_size": 1024,
+        "dataset_trust_remote_code": True,
+        "apply_b_dec_to_input": False,
+        "normalize_activations": "expected_average_only_in",
+    }
+
+
+def llama_scope_sae_loader(
+    release: str,
+    sae_id: str,
+    device: str = "cpu",
+    force_download: bool = False,
+    cfg_overrides: Optional[Dict[str, Any]] = None,
+    d_sae_override: Optional[int] = None,
+    layer_override: Optional[int] = None,
+) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor], Optional[torch.Tensor]]:
+    """
+    Custom loader for Llama Scope SAEs.
+
+    Args:
+        release: Release identifier
+        sae_id: SAE identifier
+        device: Device to load tensors to
+        force_download: Whether to force download even if files exist
+        cfg_overrides: Optional configuration overrides
+        d_sae_override: Optional override for SAE dimension
+        layer_override: Optional override for layer number
+
+    Returns:
+        Tuple of (config dict, state dict, log sparsity tensor)
+    """
+    options = SAEConfigLoadOptions(
+        device=device,
+        d_sae_override=d_sae_override,
+        layer_override=layer_override,
+    )
+    cfg_dict = get_sae_config(
+        release,
+        sae_id=sae_id,
+        options=options,
+    )
+    cfg_dict["device"] = device
+
+    # Apply overrides if provided
+    if cfg_overrides is not None:
+        cfg_dict.update(cfg_overrides)
+
+    repo_id, folder_name = get_repo_id_and_folder_name(release, sae_id=sae_id)
+
+    # Download the SAE weights
+    sae_path = hf_hub_download(
+        repo_id=repo_id,
+        filename="final.safetensors",
+        subfolder=folder_name + "/checkpoints",
+        force_download=force_download,
+    )
+
+    # Load the weights using load_file instead of safe_open
+    state_dict_loaded = load_file(sae_path, device=device)
+
+    # Convert and organize the weights
+    state_dict = {
+        "W_enc": state_dict_loaded["encoder.weight"]
+        .to(dtype=DTYPE_MAP[cfg_dict["dtype"]])
+        .T,
+        "W_dec": state_dict_loaded["decoder.weight"]
+        .to(dtype=DTYPE_MAP[cfg_dict["dtype"]])
+        .T,
+        "b_enc": state_dict_loaded["encoder.bias"].to(
+            dtype=DTYPE_MAP[cfg_dict["dtype"]]
+        ),
+        "b_dec": state_dict_loaded["decoder.bias"].to(
+            dtype=DTYPE_MAP[cfg_dict["dtype"]]
+        ),
+        "threshold": torch.ones(
+            cfg_dict["d_sae"],
+            dtype=DTYPE_MAP[cfg_dict["dtype"]],
+            device=cfg_dict["device"],
+        )
+        * cfg_dict["jump_relu_threshold"],
+    }
+
+    # No sparsity tensor for Llama Scope SAEs
+    log_sparsity = None
+
+    return cfg_dict, state_dict, log_sparsity
+
+
+def get_dictionary_learning_config_1(
+    repo_id: str, folder_name: str, options: SAEConfigLoadOptions
+) -> dict[str, Any]:
     """
     Suitable for SAEs from https://huggingface.co/canrager/lm_sae.
     """
+    config_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=f"{folder_name}/config.json",
+        force_download=options.force_download,
+    )
+    with open(config_path) as f:
+        config = json.load(f)
+
     trainer = config["trainer"]
     buffer = config["buffer"]
 
@@ -444,16 +573,50 @@ def get_dictionary_learning_config_1(config: dict[str, Any]) -> dict[str, Any]:
         "sae_lens_training_version": None,
         "prepend_bos": True,
         "dataset_path": "monology/pile-uncopyrighted",
-        "dataset_trust_remote_code": False,
         "context_size": buffer["ctx_len"],
         "normalize_activations": "none",
         "neuronpedia_id": None,
+        "dataset_trust_remote_code": True,
     }
 
 
+def get_conversion_loader_name(sae_info: Optional[PretrainedSAELookup]):
+    conversion_loader_name = "sae_lens"
+    if sae_info is not None and sae_info.conversion_func is not None:
+        conversion_loader_name = sae_info.conversion_func
+    if conversion_loader_name not in NAMED_PRETRAINED_SAE_LOADERS:
+        raise ValueError(
+            f"Conversion func '{conversion_loader_name}' not found in NAMED_PRETRAINED_SAE_LOADERS."
+        )
+    return conversion_loader_name
+
+
+def get_sae_config(
+    release: str, sae_id: str, options: SAEConfigLoadOptions
+) -> dict[str, Any]:
+    saes_directory = get_pretrained_saes_directory()
+    sae_info = saes_directory.get(release, None)
+    repo_id, folder_name = get_repo_id_and_folder_name(release, sae_id=sae_id)
+    cfg_overrides = options.cfg_overrides or {}
+    if sae_info is not None:
+        # avoid modifying the original dict
+        sae_info_overrides: dict[str, Any] = {**(sae_info.config_overrides or {})}
+        if sae_info.neuronpedia_id is not None:
+            sae_info_overrides["neuronpedia_id"] = sae_info.neuronpedia_id.get(sae_id)
+        cfg_overrides = {**sae_info_overrides, **cfg_overrides}
+
+    conversion_loader_name = get_conversion_loader_name(sae_info)
+    config_getter = NAMED_PRETRAINED_SAE_CONFIG_GETTERS[conversion_loader_name]
+    cfg = {
+        **config_getter(repo_id, folder_name=folder_name, options=options),
+        **cfg_overrides,
+    }
+    return handle_config_defaulting(cfg)
+
+
 def dictionary_learning_sae_loader_1(
-    repo_id: str,
-    folder_name: str,
+    release: str,
+    sae_id: str,
     device: str = "cpu",
     force_download: bool = False,
     cfg_overrides: Optional[dict[str, Any]] = None,
@@ -461,22 +624,20 @@ def dictionary_learning_sae_loader_1(
     """
     Suitable for SAEs from https://huggingface.co/canrager/lm_sae.
     """
-    config_path = hf_hub_download(
-        repo_id=repo_id,
-        filename=f"{folder_name}/config.json",
+    options = SAEConfigLoadOptions(
+        device=device,
         force_download=force_download,
     )
-    encoder_path = hf_hub_download(
-        repo_id=repo_id, filename=f"{folder_name}/ae.pt", force_download=force_download
-    )
-
-    with open(config_path, "r") as f:
-        config = json.load(f)
-
-    cfg_dict = get_dictionary_learning_config_1(config)
+    cfg_dict = get_sae_config(release, sae_id=sae_id, options=options)
+    cfg_dict["device"] = device
     if cfg_overrides:
         cfg_dict.update(cfg_overrides)
 
+    repo_id, folder_name = get_repo_id_and_folder_name(release, sae_id=sae_id)
+
+    encoder_path = hf_hub_download(
+        repo_id=repo_id, filename=f"{folder_name}/ae.pt", force_download=force_download
+    )
     encoder = torch.load(encoder_path, map_location="cpu")
 
     state_dict = {
@@ -500,17 +661,18 @@ def dictionary_learning_sae_loader_1(
     return cfg_dict, state_dict, None
 
 
-# Helper function to get dtype from string
-DTYPE_MAP = {
-    "float32": torch.float32,
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-}
-
-
 NAMED_PRETRAINED_SAE_LOADERS: dict[str, PretrainedSaeLoader] = {
     "sae_lens": sae_lens_loader,  # type: ignore
     "connor_rob_hook_z": connor_rob_hook_z_loader,  # type: ignore
     "gemma_2": gemma_2_sae_loader,
+    "llama_scope": llama_scope_sae_loader,
     "dictionary_learning_1": dictionary_learning_sae_loader_1,
+}
+
+NAMED_PRETRAINED_SAE_CONFIG_GETTERS = {
+    "sae_lens": get_sae_config_from_hf,
+    "connor_rob_hook_z": get_connor_rob_hook_z_config,
+    "gemma_2": get_gemma_2_config,
+    "llama_scope": get_llama_scope_config,
+    "dictionary_learning_1": get_dictionary_learning_config_1,
 }

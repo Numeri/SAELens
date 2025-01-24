@@ -1,5 +1,9 @@
-__version__ = "3.23.3"
+# ruff: noqa: E402
+__version__ = "5.2.1"
 
+import logging
+
+logger = logging.getLogger(__name__)
 
 from .analysis.hooked_sae_transformer import HookedSAETransformer
 from .cache_activations_runner import CacheActivationsRunner

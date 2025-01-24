@@ -9,7 +9,7 @@ from transformer_lens import HookedTransformer
 from sae_lens.config import LanguageModelSAERunnerConfig
 from sae_lens.training.activations_store import ActivationsStore
 from sae_lens.training.sae_trainer import SAETrainer
-from sae_lens.training.training_sae import TrainingSAE
+from sae_lens.training.training_sae import JumpReLU, TrainingSAE
 from tests.unit.helpers import build_sae_cfg
 
 
@@ -99,16 +99,13 @@ def trainer(
     model: HookedTransformer,
     activation_store: ActivationsStore,
 ):
-
-    trainer = SAETrainer(
+    return SAETrainer(
         model=model,
         sae=training_sae,
         activation_store=activation_store,
-        save_checkpoint_fn=lambda *args, **kwargs: None,
+        save_checkpoint_fn=lambda *args, **kwargs: None,  # noqa: ARG005
         cfg=cfg,
     )
-
-    return trainer
 
 
 # TODO: DECIDE IF WE ARE KEEPING ENCODE AND DECODE METHODS
@@ -154,10 +151,16 @@ def test_sae_forward(training_sae: TrainingSAE):
 
     assert train_step_output.sae_out.shape == (batch_size, d_in)
     assert train_step_output.feature_acts.shape == (batch_size, d_sae)
-    assert pytest.approx(train_step_output.loss.detach(), rel=1e-3) == (
-        train_step_output.mse_loss
-        + train_step_output.l1_loss
-        + train_step_output.ghost_grad_loss
+    assert (
+        pytest.approx(train_step_output.loss.detach(), rel=1e-3)
+        == (
+            train_step_output.losses["mse_loss"]
+            + train_step_output.losses["l1_loss"]
+            + train_step_output.losses.get("ghost_grad_loss", 0.0)
+        )
+        .detach()  # type: ignore
+        .cpu()
+        .numpy()
     )
 
     expected_mse_loss = (
@@ -168,7 +171,9 @@ def test_sae_forward(training_sae: TrainingSAE):
         .float()
     )
 
-    assert pytest.approx(train_step_output.mse_loss) == expected_mse_loss
+    assert (
+        pytest.approx(train_step_output.losses["mse_loss"].item()) == expected_mse_loss  # type: ignore
+    )
 
     if not training_sae.cfg.scale_sparsity_penalty_by_decoder_norm:
         expected_l1_loss = train_step_output.feature_acts.sum(dim=1).mean(dim=(0,))
@@ -179,7 +184,7 @@ def test_sae_forward(training_sae: TrainingSAE):
             .mean()
         )
     assert (
-        pytest.approx(train_step_output.l1_loss, rel=1e-3)
+        pytest.approx(train_step_output.losses["l1_loss"].item(), rel=1e-3)  # type: ignore
         == training_sae.cfg.l1_coefficient * expected_l1_loss.detach().float()
     )
 
@@ -203,7 +208,7 @@ def test_sae_forward_with_mse_loss_norm(
 
     assert train_step_output.sae_out.shape == (batch_size, d_in)
     assert train_step_output.feature_acts.shape == (batch_size, d_sae)
-    assert train_step_output.ghost_grad_loss == 0.0
+    assert "ghost_grad_loss" not in train_step_output.losses
 
     x_centred = x - x.mean(dim=0, keepdim=True)
     expected_mse_loss = (
@@ -217,12 +222,19 @@ def test_sae_forward_with_mse_loss_norm(
         .item()
     )
 
-    assert pytest.approx(train_step_output.mse_loss) == expected_mse_loss
+    assert (
+        pytest.approx(train_step_output.losses["mse_loss"].item()) == expected_mse_loss  # type: ignore
+    )
 
-    assert pytest.approx(train_step_output.loss.detach(), rel=1e-3) == (
-        train_step_output.mse_loss
-        + train_step_output.l1_loss
-        + train_step_output.ghost_grad_loss
+    assert (
+        pytest.approx(train_step_output.loss.detach(), rel=1e-3)
+        == (
+            train_step_output.losses["mse_loss"]
+            + train_step_output.losses["l1_loss"]
+            + train_step_output.losses.get("ghost_grad_loss", 0.0)
+        )
+        .detach()  # type: ignore
+        .numpy()
     )
 
     if not training_sae.cfg.scale_sparsity_penalty_by_decoder_norm:
@@ -234,7 +246,7 @@ def test_sae_forward_with_mse_loss_norm(
             .mean()
         )
     assert (
-        pytest.approx(train_step_output.l1_loss, rel=1e-3)
+        pytest.approx(train_step_output.losses["l1_loss"].item(), rel=1e-3)  # type: ignore
         == training_sae.cfg.l1_coefficient * expected_l1_loss.detach().float()
     )
 
@@ -242,7 +254,6 @@ def test_sae_forward_with_mse_loss_norm(
 def test_SparseAutoencoder_forward_ghost_grad_loss_non_zero(
     training_sae: TrainingSAE,
 ):
-
     training_sae.cfg.use_ghost_grads = True
     batch_size = 32
     d_in = training_sae.cfg.d_in
@@ -255,7 +266,7 @@ def test_SparseAutoencoder_forward_ghost_grad_loss_non_zero(
         ).bool(),  # all neurons are dead.
     )
 
-    assert train_step_output.ghost_grad_loss != 0.0
+    assert train_step_output.losses["ghost_grad_loss"] != 0.0
 
 
 def test_calculate_ghost_grad_loss(
@@ -270,7 +281,11 @@ def test_calculate_ghost_grad_loss(
     trainer.sae.train()
 
     # set n_forward passes since fired to < dead feature window for all neurons
-    trainer.n_forward_passes_since_fired = torch.ones_like(trainer.n_forward_passes_since_fired) * 3 * trainer.cfg.dead_feature_window  # type: ignore
+    trainer.n_forward_passes_since_fired = (
+        torch.ones_like(trainer.n_forward_passes_since_fired)
+        * 3
+        * trainer.cfg.dead_feature_window
+    )  # type: ignore
     # then set the first 10 neurons to have fired recently
     trainer.n_forward_passes_since_fired[:10] = 0
 
@@ -305,7 +320,6 @@ def test_calculate_ghost_grad_loss(
 def test_per_item_mse_loss_with_norm_matches_original_implementation(
     training_sae: TrainingSAE,
 ) -> None:
-
     training_sae.cfg.mse_loss_normalization = "dense_batch"
     training_sae.mse_loss_fn = training_sae._get_mse_loss_fn()
 
@@ -346,7 +360,6 @@ def test_SparseAutoencoder_forward_can_add_noise_to_hidden_pre() -> None:
 def test_SparseAutoencoder_remove_gradient_parallel_to_decoder_directions(
     training_sae: TrainingSAE,
 ) -> None:
-
     if not training_sae.cfg.normalize_sae_decoder:
         pytest.skip("Test only applies when decoder is not normalized")
     sae = training_sae
@@ -378,7 +391,6 @@ def test_SparseAutoencoder_remove_gradient_parallel_to_decoder_directions(
 def test_SparseAutoencoder_set_decoder_norm_to_unit_norm(
     trainer: SAETrainer,
 ) -> None:
-
     if not trainer.cfg.normalize_sae_decoder:
         pytest.skip("Test only applies when decoder is not normalized")
 
@@ -388,3 +400,45 @@ def test_SparseAutoencoder_set_decoder_norm_to_unit_norm(
     assert torch.allclose(
         torch.norm(sae.W_dec, dim=1), torch.ones_like(sae.W_dec[:, 0])
     )
+
+
+def test_jumprelu_forward():
+    x = torch.tensor([-1.0, 0.5, 1.5, 2.5])
+    threshold = torch.tensor(1.0)
+    expected_output = torch.tensor([0.0, 0.0, 1.5, 2.5])
+    output = JumpReLU.apply(x, threshold, 0.001)
+    assert torch.allclose(output, expected_output)  # type: ignore
+
+
+def test_jumprelu_backward():
+    x = torch.tensor([-1.0, 0.5, 1.5, 2.5], requires_grad=True)
+    threshold = torch.tensor(1.0)
+    output = JumpReLU.apply(x, threshold, 0.001)
+    output.sum().backward()  # type: ignore
+    expected_grad_x = torch.tensor([0.0, 0.0, 1.0, 1.0])
+    assert torch.allclose(x.grad, expected_grad_x)  # type: ignore
+
+
+def test_jumprelu_backward_with_threshold_grad():
+    bandwidth = 1e-3
+    threshold_value = 1.0
+    threshold = torch.tensor(threshold_value, requires_grad=True)
+
+    epsilon = 1e-8
+    x = torch.tensor(
+        [
+            threshold_value - bandwidth / 2 + epsilon,
+            threshold_value + bandwidth / 2 - epsilon,
+        ],
+        requires_grad=True,
+    )
+
+    output = JumpReLU.apply(x, threshold, bandwidth)
+    output.sum().backward()  # type: ignore
+
+    expected_grad_x = torch.tensor([0.0, 1.0])
+    expected_grad_threshold = torch.tensor(-2000.0)
+
+    atol = 1e-2
+    assert torch.allclose(x.grad, expected_grad_x, atol=atol)  # type: ignore
+    assert torch.isclose(threshold.grad, expected_grad_threshold, atol=atol)  # type: ignore

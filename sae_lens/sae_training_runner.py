@@ -1,17 +1,18 @@
 import json
-import logging
-import os
 import signal
+import sys
+from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, cast
 
 import torch
 import wandb
-from safetensors.torch import save_file
+from simple_parsing import ArgumentParser
 from transformer_lens.hook_points import HookedRootModule
 
+from sae_lens import logger
 from sae_lens.config import HfDataset, LanguageModelSAERunnerConfig
 from sae_lens.load_model import load_model
-from sae_lens.sae import SAE_CFG_PATH, SAE_WEIGHTS_PATH, SPARSITY_PATH
 from sae_lens.training.activations_store import ActivationsStore
 from sae_lens.training.geometric_median import compute_geometric_median
 from sae_lens.training.sae_trainer import SAETrainer
@@ -22,7 +23,7 @@ class InterruptedException(Exception):
     pass
 
 
-def interrupt_callback(sig_num: Any, stack_frame: Any):
+def interrupt_callback(sig_num: Any, stack_frame: Any):  # noqa: ARG001
     raise InterruptedException()
 
 
@@ -41,13 +42,14 @@ class SAETrainingRunner:
         cfg: LanguageModelSAERunnerConfig,
         override_dataset: HfDataset | None = None,
         override_model: HookedRootModule | None = None,
+        override_sae: TrainingSAE | None = None,
     ):
         if override_dataset is not None:
-            logging.warning(
+            logger.warning(
                 f"You just passed in a dataset which will override the one specified in your configuration: {cfg.dataset_path}. As a consequence this run will not be reproducible via configuration alone."
             )
         if override_model is not None:
-            logging.warning(
+            logger.warning(
                 f"You just passed in a model which will override the one specified in your configuration: {cfg.model_name}. As a consequence this run will not be reproducible via configuration alone."
             )
 
@@ -69,17 +71,20 @@ class SAETrainingRunner:
             override_dataset=override_dataset,
         )
 
-        if self.cfg.from_pretrained_path is not None:
-            self.sae = TrainingSAE.load_from_pretrained(
-                self.cfg.from_pretrained_path, self.cfg.device
-            )
-        else:
-            self.sae = TrainingSAE(
-                TrainingSAEConfig.from_dict(
-                    self.cfg.get_training_sae_cfg_dict(),
+        if override_sae is None:
+            if self.cfg.from_pretrained_path is not None:
+                self.sae = TrainingSAE.load_from_pretrained(
+                    self.cfg.from_pretrained_path, self.cfg.device
                 )
-            )
-            self._init_sae_group_b_decs()
+            else:
+                self.sae = TrainingSAE(
+                    TrainingSAEConfig.from_dict(
+                        self.cfg.get_training_sae_cfg_dict(),
+                    )
+                )
+                self._init_sae_group_b_decs()
+        else:
+            self.sae = override_sae
 
     def run(self):
         """
@@ -107,13 +112,11 @@ class SAETrainingRunner:
         sae = self.run_trainer_with_interruption_handling(trainer)
 
         if self.cfg.log_to_wandb:
-            # remove this type ignore comment after https://github.com/wandb/wandb/issues/8248 is resolved
-            wandb.finish()  # type: ignore
+            wandb.finish()
 
         return sae
 
     def _compile_if_needed(self):
-
         # Compile model and SAE
         #  torch.compile can provide significant speedups (10-20% in testing)
         # using max-autotune gives the best speedups but:
@@ -130,10 +133,7 @@ class SAETrainingRunner:
             )  # type: ignore
 
         if self.cfg.compile_sae:
-            if self.cfg.device == "mps":
-                backend = "aot_eager"
-            else:
-                backend = "inductor"
+            backend = "aot_eager" if self.cfg.device == "mps" else "inductor"
 
             self.sae.training_forward_pass = torch.compile(  # type: ignore
                 self.sae.training_forward_pass,
@@ -151,10 +151,10 @@ class SAETrainingRunner:
             sae = trainer.fit()
 
         except (KeyboardInterrupt, InterruptedException):
-            print("interrupted, saving progress")
-            checkpoint_name = trainer.n_training_tokens
+            logger.warning("interrupted, saving progress")
+            checkpoint_name = str(trainer.n_training_tokens)
             self.save_checkpoint(trainer, checkpoint_name=checkpoint_name)
-            print("done saving")
+            logger.info("done saving")
             raise
 
         return sae
@@ -179,59 +179,71 @@ class SAETrainingRunner:
             layer_acts = self.activations_store.storage_buffer.detach().cpu()[:, 0, :]
             self.sae.initialize_b_dec_with_mean(layer_acts)  # type: ignore
 
+    @staticmethod
     def save_checkpoint(
-        self,
         trainer: SAETrainer,
-        checkpoint_name: int | str,
+        checkpoint_name: str,
         wandb_aliases: list[str] | None = None,
-    ) -> str:
+    ) -> None:
+        base_path = Path(trainer.cfg.checkpoint_path) / checkpoint_name
+        base_path.mkdir(exist_ok=True, parents=True)
 
-        checkpoint_path = f"{trainer.cfg.checkpoint_path}/{checkpoint_name}"
+        trainer.activations_store.save(
+            str(base_path / "activations_store_state.safetensors")
+        )
 
-        os.makedirs(checkpoint_path, exist_ok=True)
+        if trainer.sae.cfg.normalize_sae_decoder:
+            trainer.sae.set_decoder_norm_to_unit_norm()
 
-        path = f"{checkpoint_path}"
-        os.makedirs(path, exist_ok=True)
-
-        if self.sae.cfg.normalize_sae_decoder:
-            self.sae.set_decoder_norm_to_unit_norm()
-        self.sae.save_model(path)
+        weights_path, cfg_path, sparsity_path = trainer.sae.save_model(
+            str(base_path),
+            trainer.log_feature_sparsity,
+        )
 
         # let's over write the cfg file with the trainer cfg, which is a super set of the original cfg.
         # and should not cause issues but give us more info about SAEs we trained in SAE Lens.
         config = trainer.cfg.to_dict()
-        with open(f"{path}/cfg.json", "w") as f:
+        with open(cfg_path, "w") as f:
             json.dump(config, f)
 
-        log_feature_sparsities = {"sparsity": trainer.log_feature_sparsity}
-
-        log_feature_sparsity_path = f"{path}/{SPARSITY_PATH}"
-        save_file(log_feature_sparsities, log_feature_sparsity_path)
-
-        if trainer.cfg.log_to_wandb and os.path.exists(log_feature_sparsity_path):
+        if trainer.cfg.log_to_wandb:
             # Avoid wandb saving errors such as:
             #   ValueError: Artifact name may only contain alphanumeric characters, dashes, underscores, and dots. Invalid name: sae_google/gemma-2b_etc
-            sae_name = self.sae.get_name().replace("/", "__")
+            sae_name = trainer.sae.get_name().replace("/", "__")
 
+            # save model weights and cfg
             model_artifact = wandb.Artifact(
                 sae_name,
                 type="model",
                 metadata=dict(trainer.cfg.__dict__),
             )
+            model_artifact.add_file(str(weights_path))
+            model_artifact.add_file(str(cfg_path))
+            wandb.log_artifact(model_artifact, aliases=wandb_aliases)
 
-            model_artifact.add_file(f"{path}/{SAE_WEIGHTS_PATH}")
-            model_artifact.add_file(f"{path}/{SAE_CFG_PATH}")
-
-            # remove this type ignore comment after https://github.com/wandb/wandb/issues/8248 is resolved
-            wandb.log_artifact(model_artifact, aliases=wandb_aliases)  # type: ignore
-
+            # save log feature sparsity
             sparsity_artifact = wandb.Artifact(
                 f"{sae_name}_log_feature_sparsity",
                 type="log_feature_sparsity",
                 metadata=dict(trainer.cfg.__dict__),
             )
-            sparsity_artifact.add_file(log_feature_sparsity_path)
-            # remove this type ignore comment after https://github.com/wandb/wandb/issues/8248 is resolved
-            wandb.log_artifact(sparsity_artifact)  # type: ignore
+            sparsity_artifact.add_file(str(sparsity_path))
+            wandb.log_artifact(sparsity_artifact)
 
-        return checkpoint_path
+
+def _parse_cfg_args(args: Sequence[str]) -> LanguageModelSAERunnerConfig:
+    if len(args) == 0:
+        args = ["--help"]
+    parser = ArgumentParser()
+    parser.add_arguments(LanguageModelSAERunnerConfig, dest="cfg")
+    return parser.parse_args(args).cfg
+
+
+# moved into its own function to make it easier to test
+def _run_cli(args: Sequence[str]):
+    cfg = _parse_cfg_args(args)
+    SAETrainingRunner(cfg=cfg).run()
+
+
+if __name__ == "__main__":
+    _run_cli(args=sys.argv[1:])

@@ -13,6 +13,7 @@ However, we are attempting to maintain this [tutorial](https://github.com/jbloom
 
  Some of the core config options are below:
 
+ - `architecture`: The architecture of the SAE to train. This can be `"standard"`, `"gated"`, or `"jumprelu"`. TopK training will be coming soon!
  - `model_name`: The base model name to train a SAE on. This must correspond to a [model from TransformerLens](https://neelnanda-io.github.io/TransformerLens/generated/model_properties_table.html).
  - `hook_name`: This is a TransformerLens hook in the model where our SAE will be trained from. More info on hooks can be found [here](https://neelnanda-io.github.io/TransformerLens/generated/demos/Main_Demo.html#Hook-Points).
  - `dataset_path`: The path to a dataset on Huggingface for training.
@@ -92,14 +93,84 @@ sparse_autoencoder = SAETrainingRunner(cfg).run()
 
 As you can see, the training setup provides a large number of options to explore. The full list of options can be found in the [LanguageModelSAERunnerConfig][sae_lens.LanguageModelSAERunnerConfig] class.
 
+### Training Topk SAEs
+
+By default, SAELens will train SAEs using a L1 loss term with ReLU activation. A popular alternative architecture is the [TopK](https://arxiv.org/abs/2406.04093) architecture, which fixes the L0 of the SAE using a TopK activation function. To train a TopK SAE, set the `architecture` parameter to `"topk"` in the config. You can set the `k` parameter via `activation_fn_kwargs`. If not set, the default is `k=100`. The TopK architecture ignores the `l1_coefficient` parameter.
+
+```python
+cfg = LanguageModelSAERunnerConfig(
+    architecture="topk",
+    activation_fn_kwargs={"k": 100},
+    # ...
+)
+sparse_autoencoder = SAETrainingRunner(cfg).run()
+```
+
+### Training JumpReLU SAEs
+
+[JumpReLU SAEs](https://arxiv.org/abs/2407.14435) are the current state-of-the-art SAE architecture, but are often more tricky to train than other architectures. To train a JumpReLU SAE, set the `architecture` parameter to `"jumprelu"` in the config. JumpReLU SAEs use an sparsity penalty that is controlled using the `l1_coefficient` parameter. This is technically a misnomer as the JumpReLU sparsity penalty is not a L1 penalty, but we keep the parameter name for consistency with the L1 penalty used by the standard architecture. The JumpReLU architecture also has two additional parameters: `jumprelu_bandwidth` and `jumprelu_init_threshold`. Both of these are likely fine at their default values, but may be worth experimenting with if JumpReLU training is too slow to converge.
+
+```python
+cfg = LanguageModelSAERunnerConfig(
+    architecture="jumprelu",
+    l1_coefficient=5.0,
+    jumprelu_bandwidth=0.001,
+    jumprelu_init_threshold=0.001,
+    # ...
+)
+sparse_autoencoder = SAETrainingRunner(cfg).run()
+```
+
+### Training Gated SAEs
+
+[Gated SAEs](https://arxiv.org/abs/2404.16014) are a precursor to JumpReLU SAEs, but using a simpler training procedure that should make them easier to train. To train a Gated SAE, set the `architecture` parameter to `"gated"` in the config. Gated SAEs use the `l1_coefficient` parameter to control the sparsity of the SAE, the same as standard SAEs. If JumpReLU training is too slow to converge, it may be worth trying a Gated SAE instead.
+
+```python
+cfg = LanguageModelSAERunnerConfig(
+    architecture="gated",
+    l1_coefficient=5.0,
+    # ...
+)
+sparse_autoencoder = SAETrainingRunner(cfg).run()
+```
+
+## CLI Runner
+
+The SAE training runner can also be run from the command line via the `sae_lens.sae_training_runner` module. This can be useful for quickly testing different hyperparameters or running training on a remote server. The command line interface is shown below. All options to the CLI are the same as the [LanguageModelSAERunnerConfig][sae_lens.LanguageModelSAERunnerConfig] with a `--` prefix. E.g., `--model_name` is the same as `model_name` in the config.
+
+```bash
+python -m sae_lens.sae_training_runner --help
+```
+
 ## Logging to Weights and Biases
 
 For any real training run, you should be logging to Weights and Biases (WandB). This will allow you to track your training progress and compare different runs. To enable WandB, set `log_to_wandb=True`. The `wandb_project` parameter in the config controls the project name in WandB. You can also control the logging frequency with `wandb_log_frequency` and `eval_every_n_wandb_logs`.
 
-A number of helpful metrics are logged to WandB, including the sparsity of the SAE, the mean squared error (MSE) of the SAE, dead features, and explained variance. These metrics can be used to monitor the training progress and adjust the training parameters. Below is a screenshot from one training run. 
+A number of helpful metrics are logged to WandB, including the sparsity of the SAE, the mean squared error (MSE) of the SAE, dead features, and explained variance. These metrics can be used to monitor the training progress and adjust the training parameters. Below is a screenshot from one training run.
 
 ![screenshot](dashboard_screenshot.png)
 
+
+## Best practices for real SAEs
+
+It may sound daunting to train a real SAE but nothing could be further from the truth! You can typically train a decent SAE for a real LLM on a single A100 GPU in a matter of hours.
+
+SAE Training best practices are still rapidly evolving, so the default settings in SAELens may not be optimal for real SAEs. Fortunately, it's easy to see what any SAE trained using SAELens used for its training configuration and just copy its values as a starting point! If there's a SAE on Huggingface trained using SAELens, you can see all the training settings used by looking at the `cfg.json` file in the SAE's repo. For instance, here's the [cfg.json](https://huggingface.co/jbloom/Gemma-2b-Residual-Stream-SAEs/blob/main/gemma_2b_blocks.12.hook_resid_post_16384/cfg.json) for a Gemma 2B standard SAE trained by Joseph Bloom. You can also get the config in SAELens as the second return value from `SAE.from_pretrained()`. For instance, the same config mentioned above can be accessed as `cfg_dict = SAE.from_pretrained("jbloom/Gemma-2b-Residual-Stream-SAEs", "gemma_2b_blocks.12.hook_resid_post_16384")[1]`. You can browse all SAEs uploaded to Huggingface via SAELens to get some inspiration with the [SAELens library tag](https://huggingface.co/models?library=saelens).
+
+Some general performance tips:
+
+- If your GPU supports it (most modern nvidia-GPUs do), setting `autocast=True` and `autocast_lm=True` in the config will dramatically speed up training.
+- We find that often SAEs struggle to train well with `dtype="bfloat16"`. We aren't sure why this is, but make sure to compare the SAE quality if you change the dtype.
+- You can try turning on `compile_sae=True` and `compile_llm=True`in the config to see if it makes training faster. Your mileage may vary though, compilation can be finicky.
+
+### JumpReLU SAEs
+
+JumpReLU SAEs are a state-of-the-art SAE architecture from [DeepMind](https://arxiv.org/abs/2407.14435) which at present gives the best known sparsity vs reconstruction error trade-off, and is the architecture used for [Gemma Scope SAEs](https://deepmind.google/discover/blog/gemma-scope-helping-the-safety-community-shed-light-on-the-inner-workings-of-language-models/). However, JumpReLU SAEs are slightly trickier to train than standard SAEs due to how the threshold is learned. We recommend the following tips for training JumpReLU SAEs:
+
+- Make sure to train on enough tokens. We've found that at least 2B tokens and ideally 4B tokens is needed for good performance with the default `jumprelu_bandwidth` setting. This may vary depending on the model and SAE size though, so make sure to monitor the training logs to ensure convergence.
+- Set `normalize_activations="expected_average_only_in"` in the config. This helps with convergence and is generally a good idea for all SAEs.
+
+You can find a sample config for a Gemma-2-2B JumpReLU SAE trained via SAELens here: [cfg.json](https://huggingface.co/chanind/sae-gemma-2-2b-layer-1-res-jumprelu/blob/main/blocks.1.hook_resid_post/cfg.json)
 
 ## Checkpoints
 
@@ -113,6 +184,10 @@ The SAE training runner uses the Adam optimizer with a constant learning rate by
 The learning rate scheduler can be controlled with the `lr_scheduler_name` parameter. The available schedulers are: `constant` (default), `consineannealing`, and `cosineannealingwarmrestarts`. All schedulers can be used with linear warmup and linear decay, set via `lr_warm_up_steps` and `lr_decay_steps`.
 
 To avoid dead features, it's often helpful to slowly increase the L1 penalty. This can be done by setting `l1_warm_up_steps` to a value larger than 0. This will linearly increase the L1 penalty over the first `l1_warm_up_steps` training steps.
+
+## Training on Huggingface Models
+
+While TransformerLens is the recommended way to use SAELens, it is also possible to use any Huggingface AutoModelForCausalLM as the model. This is useful if you want to use a model that is not supported by TransformerLens, or if you cannot use TransformerLens due to memory or performance reasons. To use a Huggingface AutoModelForCausalLM, you can specify `model_class_name = 'AutoModelForCausalLM'` in the SAE config. Your hook points will then need to correspond to the named parameters of the Huggingface model rather than the typical TransformerLens hook points. For instance, if you were using GPT2 from Huggingface, you would use `hook_name = 'transformer.h.1'` rather than `hook_name = 'blocks.1.hook_resid_post'`. Otherwise everything should work the same as with TransformerLens models.
 
 
 ## Datasets, streaming, and context size
@@ -180,15 +255,15 @@ cfg = CacheActivationsRunnerConfig(
     model_name="tiny-stories-1L-21M",
     hook_name="blocks.0.hook_mlp_out",
     dataset_path="apollo-research/roneneldan-TinyStories-tokenizer-gpt2",
-    # ... 
-    new_cached_activations_path="./tiny-stories-1L-21M-cache"
+    # ...
+    new_cached_activations_path="./tiny-stories-1L-21M-cache",
+    hf_repo_id="your-username/tiny-stories-1L-21M-cache", # To push to hub
 )
 
 CacheActivationsRunner(cfg).run()
 ```
 
 To use the cached activations during training, set `use_cached_activations=True` and `cached_activations_path` to match the `new_cached_activations_path` above option in training configuration.
-
 
 ## Uploading SAEs to Huggingface
 

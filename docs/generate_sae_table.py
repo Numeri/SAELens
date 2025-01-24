@@ -1,17 +1,16 @@
 # type: ignore
-import json
+# ruff: noqa: T201
 from pathlib import Path
+from textwrap import dedent
 
 import pandas as pd
 import yaml
-from huggingface_hub import hf_hub_download
 from tqdm import tqdm
 
 from sae_lens import SAEConfig
 from sae_lens.toolkit.pretrained_sae_loaders import (
-    get_dictionary_learning_config_1,
-    get_gemma_2_config,
-    get_sae_config_from_hf,
+    SAEConfigLoadOptions,
+    get_sae_config,
     handle_config_defaulting,
 )
 
@@ -19,7 +18,6 @@ INCLUDED_CFG = [
     "id",
     "architecture",
     "neuronpedia",
-    # "model_name",
     "hook_name",
     "hook_layer",
     "d_sae",
@@ -29,7 +27,7 @@ INCLUDED_CFG = [
 ]
 
 
-def on_pre_build(config):
+def on_pre_build(config):  # noqa: ARG001
     print("Generating SAE table...")
     generate_sae_table()
     print("SAE table generation complete.")
@@ -38,7 +36,7 @@ def on_pre_build(config):
 def generate_sae_table():
     # Read the YAML file
     yaml_path = Path("sae_lens/pretrained_saes.yaml")
-    with open(yaml_path, "r") as file:
+    with open(yaml_path) as file:
         data = yaml.safe_load(file)
 
     # Start the Markdown content
@@ -47,9 +45,9 @@ def generate_sae_table():
     markdown_content += "*This file contains the contents of `sae_lens/pretrained_saes.yaml` in Markdown*\n\n"
 
     # Generate content for each model
-    for model_name, model_info in tqdm(data.items()):
+    for release, model_info in tqdm(data.items()):
         repo_link = f"https://huggingface.co/{model_info['repo_id']}"
-        markdown_content += f"## [{model_name}]({repo_link})\n\n"
+        markdown_content += f"## [{release}]({repo_link})\n\n"
         markdown_content += f"- **Huggingface Repo**: {model_info['repo_id']}\n"
         markdown_content += f"- **model**: {model_info['model']}\n"
 
@@ -60,89 +58,44 @@ def generate_sae_table():
 
         markdown_content += "\n"
 
-        # get the config
-
-        # for sae_info in model_info["saes"]:
-        #     sae_cfg = get_sae_config_from_hf(
-        #         model_info["repo_id"],
-        #         sae_info["path"],
-        #     )
-
         for info in tqdm(model_info["saes"]):
-
             # can remove this by explicitly overriding config in yaml. Do this later.
-            if model_info["conversion_func"] == "connor_rob_hook_z":
-                repo_id = model_info["repo_id"]
-                folder_name = info["path"]
-                config_path = folder_name.split(".pt")[0] + "_cfg.json"
-                config_path = hf_hub_download(repo_id, config_path)
-                old_cfg_dict = json.load(open(config_path, "r"))
+            sae_id = info["id"]
+            cfg = get_sae_config(
+                release,
+                sae_id=sae_id,
+                options=SAEConfigLoadOptions(),
+            )
+            cfg = handle_config_defaulting(cfg)
+            cfg = SAEConfig.from_dict(cfg).to_dict()
 
-                cfg = {
-                    "architecture": "standard",
-                    "d_in": old_cfg_dict["act_size"],
-                    "d_sae": old_cfg_dict["dict_size"],
-                    "dtype": "float32",
-                    "device": "cpu",
-                    "model_name": "gpt2-small",
-                    "hook_name": old_cfg_dict["act_name"],
-                    "hook_layer": old_cfg_dict["layer"],
-                    "hook_head_index": None,
-                    "activation_fn_str": "relu",
-                    "apply_b_dec_to_input": True,
-                    "finetuning_scaling_factor": False,
-                    "sae_lens_training_version": None,
-                    "prepend_bos": True,
-                    "dataset_path": "Skylion007/openwebtext",
-                    "context_size": 128,
-                    "normalize_activations": "none",
-                    "dataset_trust_remote_code": True,
-                }
-                cfg = handle_config_defaulting(cfg)
-                cfg = SAEConfig.from_dict(cfg).to_dict()
-                info.update(cfg)
-            elif model_info["conversion_func"] == "dictionary_learning_1":
-                repo_id = model_info["repo_id"]
-                folder_name = info["path"]
-                config_path = hf_hub_download(
-                    repo_id=repo_id,
-                    filename=f"{folder_name}/config.json",
-                )
-                with open(config_path, "r") as f:
-                    cfg = get_dictionary_learning_config_1(json.load(f))
-                cfg = SAEConfig.from_dict(cfg).to_dict()
-
-            elif model_info["conversion_func"] == "gemma_2":
-                repo_id = model_info["repo_id"]
-                folder_name = info["path"]
-                cfg = get_gemma_2_config(repo_id, folder_name)
-                cfg = handle_config_defaulting(cfg)
-                cfg = SAEConfig.from_dict(cfg).to_dict()
-                info.update(cfg)
-            else:
-                cfg = get_sae_config_from_hf(
-                    model_info["repo_id"],
-                    info["path"],
-                )
-                cfg = handle_config_defaulting(cfg)
-                cfg = SAEConfig.from_dict(cfg).to_dict()
-
-            if "neuronpedia" not in info.keys():
+            if "neuronpedia" not in info:
                 info["neuronpedia"] = None
 
             info.update(cfg)
 
-        # cfg_to_in
-        # Create DataFrame for SAEs
         df = pd.DataFrame(model_info["saes"])
 
         # Keep only 'id' and 'path' columns
         df = df[INCLUDED_CFG]
 
-        # Generate Markdown table
+        def style_id(val):
+            return f"<div>{val}</div><a class=\"saetable-loadSaeId\" onclick=\"SaeTable.showCode('{release}', '{val}')\">Load this SAE</a>"
+
+        df["id"] = df["id"].apply(style_id)
         table = df.to_markdown(index=False)
         markdown_content += table + "\n\n"
-
+    markdown_content += dedent(
+        """
+        <div id="codeModal" class="saetable-modal">
+            <div class="saetable-modalContent">
+                <span class="saetable-close" onclick="SaeTable.closeCode()">&times;</span>
+                <pre><code id="codeContent" onclick="SaeTable.selectCode(this)"></code></pre>
+                <button onclick="SaeTable.copyCode()" class="saetable-copyButton">Copy Code</button>
+            </div>
+        </div>
+        """
+    )
     # Write the content to a Markdown file
     output_path = Path("docs/sae_table.md")
     with open(output_path, "w") as file:

@@ -1,14 +1,18 @@
+import os
+import tempfile
 from collections.abc import Iterable
 from math import ceil
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import pytest
 import torch
 from datasets import Dataset, IterableDataset
+from safetensors.torch import load_file
 from transformer_lens import HookedTransformer
 
 from sae_lens.config import LanguageModelSAERunnerConfig, PretokenizeRunnerConfig
+from sae_lens.load_model import load_model
 from sae_lens.pretokenize_runner import pretokenize_dataset
 from sae_lens.training.activations_store import (
     ActivationsStore,
@@ -20,7 +24,7 @@ from tests.unit.helpers import build_sae_cfg, load_model_cached
 def tokenize_with_bos(model: HookedTransformer, text: str) -> list[int]:
     assert model.tokenizer is not None
     assert model.tokenizer.bos_token_id is not None
-    return [model.tokenizer.bos_token_id] + model.tokenizer.encode(text)
+    return [model.tokenizer.bos_token_id] + model.tokenizer.encode(text)  # type: ignore
 
 
 # Define a new fixture for different configurations
@@ -179,6 +183,35 @@ def test_activations_store__get_activations_head_hook(ts_model: HookedTransforme
         activation_store_head_hook.d_in,
     )
     assert activations.device == activation_store_head_hook.device
+
+
+def test_activations_store__get_activations__gives_same_results_with_hf_model_and_tlens_model():
+    hf_model = load_model(
+        model_class_name="AutoModelForCausalLM",
+        model_name="gpt2",
+        device="cpu",
+    )
+    tlens_model = HookedTransformer.from_pretrained_no_processing("gpt2", device="cpu")
+    dataset = Dataset.from_list(
+        [
+            {"text": "hello world"},
+        ]
+        * 100
+    )
+
+    cfg = build_sae_cfg(hook_name="blocks.4.hook_resid_post", hook_layer=4, d_in=768)
+    store_tlens = ActivationsStore.from_config(
+        tlens_model, cfg, override_dataset=dataset
+    )
+    batch_tlens = store_tlens.get_batch_tokens()
+    activations_tlens = store_tlens.get_activations(batch_tlens)
+
+    cfg = build_sae_cfg(hook_name="transformer.h.4", hook_layer=4, d_in=768)
+    store_hf = ActivationsStore.from_config(hf_model, cfg, override_dataset=dataset)
+    batch_hf = store_hf.get_batch_tokens()
+    activations_hf = store_hf.get_activations(batch_hf)
+
+    assert torch.allclose(activations_hf, activations_tlens, atol=1e-3)
 
 
 # 12 is divisible by the length of "hello world", 11 and 13 are not
@@ -349,11 +382,33 @@ def test_activations_store___iterate_tokenized_sequences__yields_sequences_of_co
         assert toks.shape == (5,)
 
 
+def test_activations_store___iterate_tokenized_sequences__works_with_huggingface_models():
+    hf_model = load_model(
+        model_class_name="AutoModelForCausalLM",
+        model_name="gpt2",
+        device="cpu",
+    )
+    cfg = build_sae_cfg(prepend_bos=True, context_size=5)
+    dataset = Dataset.from_list(
+        [
+            {"text": "hello world1"},
+            {"text": "hello world2"},
+            {"text": "hello world3"},
+        ]
+        * 20
+    )
+    activation_store = ActivationsStore.from_config(
+        hf_model, cfg, override_dataset=dataset
+    )
+    for toks in activation_store._iterate_tokenized_sequences():
+        assert toks.shape == (5,)
+
+
 # We expect the code to work for context_size being less than or equal to the
 # length of the dataset
 @pytest.mark.parametrize(
     "context_size, expected_error",
-    [(-1, ValueError), (5, RuntimeWarning), (10, None), (15, ValueError)],
+    [(5, RuntimeWarning), (10, None), (15, ValueError)],
 )
 def test_activations_store__errors_on_context_size_mismatch(
     ts_model: HookedTransformer, context_size: int, expected_error: Optional[ValueError]
@@ -387,6 +442,12 @@ def test_activations_store__errors_on_context_size_mismatch(
     else:
         # If the context_size is equal to the dataset size the function should pass
         ActivationsStore.from_config(ts_model, cfg, override_dataset=tokenized_dataset)
+
+
+def test_activations_store__errors_on_negative_context_size():
+    with pytest.raises(ValueError):
+        # We should raise an error when the context_size is negative
+        build_sae_cfg(prepend_bos=True, context_size=-1)
 
 
 def test_activations_store___iterate_tokenized_sequences__yields_identical_results_with_and_without_pretokenizing(
@@ -478,3 +539,68 @@ def test_validate_pretokenized_dataset_tokenizer_does_nothing_if_the_dataset_pat
     model_tokenizer = ts_model.tokenizer
     assert model_tokenizer is not None
     validate_pretokenized_dataset_tokenizer(ds_path, model_tokenizer)
+
+
+def test_activations_store_respects_position_offsets(ts_model: HookedTransformer):
+    cfg = build_sae_cfg(
+        context_size=10,
+        seqpos_slice=(2, 8),  # Only consider positions 2 to 7 (inclusive)
+    )
+    dataset = Dataset.from_list(
+        [
+            {"text": "This is a test sentence for slicing."},
+        ]
+        * 100
+    )
+
+    activation_store = ActivationsStore.from_config(
+        ts_model, cfg, override_dataset=dataset
+    )
+
+    batch = activation_store.get_batch_tokens(1)
+    activations = activation_store.get_activations(batch)
+
+    assert batch.shape == (1, 10)  # Full context size
+    assert activations.shape == (1, 6, 1, cfg.d_in)  # Only 6 positions (2 to 7)
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {
+            "sae_kwargs": {
+                "normalize_activations": "none",
+            },
+            "should_save": False,
+        },
+        {
+            "sae_kwargs": {
+                "normalize_activations": "expected_average_only_in",
+            },
+            "should_save": True,
+        },
+    ],
+)
+def test_activations_store_save_with_norm_scaling_factor(
+    ts_model: HookedTransformer, params: dict[str, Any]
+):
+    cfg = build_sae_cfg(**params["sae_kwargs"])
+    activation_store = ActivationsStore.from_config(ts_model, cfg)
+    activation_store.set_norm_scaling_factor_if_needed()
+    if params["sae_kwargs"]["normalize_activations"] == "expected_average_only_in":
+        assert activation_store.estimated_norm_scaling_factor is not None
+    with tempfile.NamedTemporaryFile() as temp_file:
+        activation_store.save(temp_file.name)
+        assert os.path.exists(temp_file.name)
+        state_dict = load_file(temp_file.name)
+        assert isinstance(state_dict, dict)
+        if params["should_save"]:
+            assert "estimated_norm_scaling_factor" in state_dict
+            estimated_norm_scaling_factor = state_dict["estimated_norm_scaling_factor"]
+            assert estimated_norm_scaling_factor.shape == ()
+            assert (
+                estimated_norm_scaling_factor.item()
+                == activation_store.estimated_norm_scaling_factor
+            )
+        else:
+            assert "estimated_norm_scaling_factor" not in state_dict

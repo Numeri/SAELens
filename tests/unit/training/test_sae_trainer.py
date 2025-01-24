@@ -4,10 +4,12 @@ from typing import Any, Callable
 import pytest
 import torch
 from datasets import Dataset
+from safetensors.torch import load_file
 from transformer_lens import HookedTransformer
 
 from sae_lens import __version__
 from sae_lens.config import LanguageModelSAERunnerConfig
+from sae_lens.sae_training_runner import SAETrainingRunner
 from sae_lens.training.activations_store import ActivationsStore
 from sae_lens.training.sae_trainer import (
     SAETrainer,
@@ -21,8 +23,7 @@ from tests.unit.helpers import TINYSTORIES_MODEL, build_sae_cfg, load_model_cach
 
 @pytest.fixture
 def cfg():
-    cfg = build_sae_cfg(d_in=64, d_sae=128, hook_layer=0)
-    return cfg
+    return build_sae_cfg(d_in=64, d_sae=128, hook_layer=0)
 
 
 @pytest.fixture
@@ -49,16 +50,13 @@ def trainer(
     model: HookedTransformer,
     activation_store: ActivationsStore,
 ):
-
-    trainer = SAETrainer(
+    return SAETrainer(
         model=model,
         sae=training_sae,
         activation_store=activation_store,
-        save_checkpoint_fn=lambda *args, **kwargs: None,
+        save_checkpoint_fn=lambda *args, **kwargs: None,  # noqa: ARG005
         cfg=cfg,
     )
-
-    return trainer
 
 
 def modify_sae_output(sae: TrainingSAE, modifier: Callable[[torch.Tensor], Any]):
@@ -77,8 +75,7 @@ def modify_sae_output(sae: TrainingSAE, modifier: Callable[[torch.Tensor], Any])
 def test_train_step__reduces_loss_when_called_repeatedly_on_same_acts(
     trainer: SAETrainer,
 ) -> None:
-
-    layer_acts = trainer.activation_store.next_batch()
+    layer_acts = trainer.activations_store.next_batch()
 
     # intentionally train on the same activations 5 times to ensure loss decreases
     train_outputs = [
@@ -98,8 +95,7 @@ def test_train_step__reduces_loss_when_called_repeatedly_on_same_acts(
 
 
 def test_train_step__output_looks_reasonable(trainer: SAETrainer) -> None:
-
-    layer_acts = trainer.activation_store.next_batch()
+    layer_acts = trainer.activations_store.next_batch()
 
     output = trainer._train_step(
         sae=trainer.sae,
@@ -112,7 +108,7 @@ def test_train_step__output_looks_reasonable(trainer: SAETrainer) -> None:
     assert output.sae_out.shape == output.sae_in.shape
     assert output.feature_acts.shape == (4, 128)  # batch_size, d_sae
     # ghots grads shouldn't trigger until dead_feature_window, which hasn't been reached yet
-    assert output.ghost_grad_loss == 0
+    assert output.losses.get("ghost_grad_loss", 0) == 0
     assert trainer.n_frac_active_tokens == 4
     assert trainer.act_freq_scores.sum() > 0  # at least SOME acts should have fired
     assert torch.allclose(
@@ -123,9 +119,8 @@ def test_train_step__output_looks_reasonable(trainer: SAETrainer) -> None:
 def test_train_step__sparsity_updates_based_on_feature_act_sparsity(
     trainer: SAETrainer,
 ) -> None:
-
     trainer._reset_running_sparsity_stats()
-    layer_acts = trainer.activation_store.next_batch()
+    layer_acts = trainer.activations_store.next_batch()
 
     train_output = trainer._train_step(
         sae=trainer.sae,
@@ -163,15 +158,17 @@ def test_log_feature_sparsity__handles_zeroes_by_default_fp16() -> None:
 
 
 def test_build_train_step_log_dict(trainer: SAETrainer) -> None:
-
     train_output = TrainStepOutput(
         sae_in=torch.tensor([[-1, 0], [0, 2], [1, 1]]).float(),
         sae_out=torch.tensor([[0, 0], [0, 2], [0.5, 1]]).float(),
         feature_acts=torch.tensor([[0, 0, 0, 1], [1, 0, 0, 1], [1, 0, 1, 1]]).float(),
+        hidden_pre=torch.tensor([[-1, 0, 0, 1], [1, -1, 0, 1], [1, -1, 1, 1]]).float(),
         loss=torch.tensor(0.5),
-        mse_loss=0.25,
-        l1_loss=0.1,
-        ghost_grad_loss=0.15,
+        losses={
+            "mse_loss": 0.25,
+            "l1_loss": 0.1,
+            "ghost_grad_loss": 0.15,
+        },
     )
 
     # we're relying on the trainer only for some of the metrics here
@@ -183,9 +180,10 @@ def test_build_train_step_log_dict(trainer: SAETrainer) -> None:
     assert log_dict == {
         "losses/mse_loss": 0.25,
         # l1 loss is scaled by l1_coefficient
-        "losses/l1_loss": train_output.l1_loss / trainer.cfg.l1_coefficient,
-        "losses/auxiliary_reconstruction_loss": 0.0,
+        "losses/l1_loss": train_output.losses["l1_loss"] / trainer.cfg.l1_coefficient,
+        "losses/raw_l1_loss": train_output.losses["l1_loss"],
         "losses/overall_loss": 0.5,
+        "losses/ghost_grad_loss": 0.15,
         "metrics/explained_variance": 0.75,
         "metrics/explained_variance_std": 0.25,
         "metrics/l0": 2.0,
@@ -204,11 +202,11 @@ def test_train_sae_group_on_language_model__runs(
     checkpoint_dir = tmp_path / "checkpoint"
     cfg = build_sae_cfg(
         checkpoint_path=str(checkpoint_dir),
-        training_tokens=100,
+        training_tokens=20,
         context_size=8,
     )
     # just a tiny datast which will run quickly
-    dataset = Dataset.from_list([{"text": "hello world"}] * 2000)
+    dataset = Dataset.from_list([{"text": "hello world"}] * 100)
     activation_store = ActivationsStore.from_config(
         ts_model, cfg, override_dataset=dataset
     )
@@ -217,7 +215,7 @@ def test_train_sae_group_on_language_model__runs(
         model=ts_model,
         sae=sae,
         activation_store=activation_store,
-        save_checkpoint_fn=lambda *args, **kwargs: None,
+        save_checkpoint_fn=lambda *args, **kwargs: None,  # noqa: ARG005
         cfg=cfg,
     ).fit()
 
@@ -229,3 +227,67 @@ def test_update_sae_lens_training_version_sets_the_current_version():
     sae = TrainingSAE.from_dict(cfg.get_training_sae_cfg_dict())
     _update_sae_lens_training_version(sae)
     assert sae.cfg.sae_lens_training_version == str(__version__)
+
+
+def test_estimated_norm_scaling_factor_persistence(
+    ts_model: HookedTransformer,
+    tmp_path: Path,
+):
+    """Test that estimated_norm_scaling_factor is correctly persisted in intermediate checkpoints
+    but not in the final checkpoint."""
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir(exist_ok=True)
+
+    cfg = build_sae_cfg(
+        checkpoint_path=str(checkpoint_dir),
+        training_tokens=100,  # Increased to ensure we hit checkpoints
+        context_size=8,
+        normalize_activations="expected_average_only_in",
+        n_checkpoints=2,  # Explicitly request 2 checkpoints during training
+    )
+
+    # Create a small dataset
+    dataset = Dataset.from_list([{"text": "hello world"}] * 100)
+    activation_store = ActivationsStore.from_config(
+        ts_model, cfg, override_dataset=dataset
+    )
+    sae = TrainingSAE.from_dict(cfg.get_training_sae_cfg_dict())
+
+    trainer = SAETrainer(
+        model=ts_model,
+        sae=sae,
+        activation_store=activation_store,
+        save_checkpoint_fn=SAETrainingRunner.save_checkpoint,
+        cfg=cfg,
+    )
+
+    # Train the model - this should create checkpoints
+    trainer.fit()
+    checkpoint_paths = list(
+        checkpoint_dir.glob("**/activations_store_state.safetensors")
+    )
+    # We should have exactly 2 checkpoints:
+    assert (
+        len(checkpoint_paths) == 2
+    ), f"Expected 2 checkpoints but got {len(checkpoint_paths)}"
+    during_checkpoints = [
+        load_file(path) for path in checkpoint_paths if "final" not in path.parent.name
+    ]
+    final_checkpoints = [
+        load_file(path) for path in checkpoint_paths if "final" in path.parent.name
+    ]
+    assert (
+        len(during_checkpoints) == 1
+    ), f"Expected 1 other checkpoint but got {len(during_checkpoints)}"
+    assert (
+        len(final_checkpoints) == 1
+    ), f"Expected 1 final checkpoint but got {len(final_checkpoints)}"
+    during_checkpoint = during_checkpoints[0]
+    final_checkpoint = final_checkpoints[0]
+
+    # Check intermediate checkpoints have the scaling factor
+    assert "estimated_norm_scaling_factor" in during_checkpoint
+    assert during_checkpoint["estimated_norm_scaling_factor"] is not None
+
+    # Final checkpoint should NOT have the scaling factor as it's been folded into the weights
+    assert "estimated_norm_scaling_factor" not in final_checkpoint

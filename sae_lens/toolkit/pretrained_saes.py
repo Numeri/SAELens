@@ -7,14 +7,14 @@ from huggingface_hub import hf_hub_download, list_repo_tree
 from safetensors import safe_open
 from tqdm import tqdm
 
+from sae_lens import logger
 from sae_lens.sae import SAE
 
 
 def load_sparsity(path: str) -> torch.Tensor:
     sparsity_path = os.path.join(path, "sparsity.safetensors")
     with safe_open(sparsity_path, framework="pt", device="cpu") as f:  # type: ignore
-        sparsity = f.get_tensor("sparsity")
-    return sparsity
+        return f.get_tensor("sparsity")
 
 
 def download_sae_from_hf(
@@ -22,7 +22,6 @@ def download_sae_from_hf(
     folder_name: str = "blocks.0.hook_resid_pre",
     force_download: bool = False,
 ) -> Tuple[str, str, Optional[str]]:
-
     FILENAME = f"{folder_name}/cfg.json"
     cfg_path = hf_hub_download(
         repo_id=repo_id, filename=FILENAME, force_download=force_download
@@ -76,7 +75,6 @@ def get_gpt2_res_jb_saes(
     saes = {}
     sparsities = {}
     for hook_point in tqdm(GPT2_SMALL_RESIDUAL_SAES_HOOK_POINTS):
-
         _, sae_path, _ = download_sae_from_hf(
             repo_id=GPT2_SMALL_RESIDUAL_SAES_REPO_ID, folder_name=hook_point
         )
@@ -95,7 +93,6 @@ def get_gpt2_res_jb_saes(
 def convert_connor_rob_sae_to_our_saelens_format(
     state_dict: dict[str, torch.Tensor],
     config: dict[str, int | str],
-    device: str = "cpu",
 ):
     """
 
@@ -114,7 +111,6 @@ def convert_connor_rob_sae_to_our_saelens_format(
 
 
 def get_gpt2_small_ckrk_attn_out_saes() -> dict[str, SAE]:
-
     REPO_ID = "ckkissane/attn-saes-gpt2-small-all-layers"
 
     # list all files in repo
@@ -139,12 +135,13 @@ def get_gpt2_small_ckrk_attn_out_saes() -> dict[str, SAE]:
             # print(f"Downloading {file_name}")
             config_path = hf_hub_download(REPO_ID, file_name)
             name = config_path.split("/")[-1].split("_cfg.json")[0]
-            sae_configs[name] = json.load(open(config_path, "r"))
+            with open(config_path) as f:
+                sae_configs[name] = json.load(f)
             sae_configs[name].device = device
 
     saes = {}
     for name, config in sae_configs.items():
-        print(f"Loading {name}")
+        logger.debug(f"Loading {name}")
         saes[name] = convert_connor_rob_sae_to_our_saelens_format(
             saes_weights[name], config
         )
