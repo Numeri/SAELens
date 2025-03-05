@@ -49,7 +49,8 @@ class SAEConfig:
     finetuning_scaling_factor: bool
 
     # dataset it was trained on details.
-    context_size: int
+    context_size_in: int
+    context_size_out: int
     model_name: str
     hook_name: str
     hook_layer: int
@@ -78,6 +79,10 @@ class SAEConfig:
             "activation_fn": "activation_fn_str",
         }
         config_dict = {rename_dict.get(k, k): v for k, v in config_dict.items()}
+
+        if 'context_size' in config_dict:
+            config_dict['context_size_in'] = config_dict.pop('context_size')
+            config_dict['context_size_out'] = config_dict['context_size_in']
 
         # use only config terms that are in the dataclass
         config_dict = {
@@ -112,7 +117,8 @@ class SAEConfig:
             "prepend_bos": self.prepend_bos,
             "dataset_path": self.dataset_path,
             "dataset_trust_remote_code": self.dataset_trust_remote_code,
-            "context_size": self.context_size,
+            "context_size_in": self.context_size_in,
+            "context_size_out": self.context_size_out,
             "normalize_activations": self.normalize_activations,
             "neuronpedia_id": self.neuronpedia_id,
             "model_from_pretrained_kwargs": self.model_from_pretrained_kwargs,

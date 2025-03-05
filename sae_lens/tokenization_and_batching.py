@@ -7,7 +7,7 @@ def _add_tokens_to_batch(
     batch: torch.Tensor | None,
     tokens: torch.Tensor,
     offset: int,
-    context_size: int,
+    context_size_in: int,
     is_start_of_sequence: bool,
     begin_batch_token_id: int | None = None,
     begin_sequence_token_id: int | None = None,
@@ -33,9 +33,9 @@ def _add_tokens_to_batch(
             if first_token != begin_batch_token_id_tensor:
                 prefix_toks.insert(0, begin_batch_token_id_tensor)
                 first_token = begin_batch_token_id_tensor
-        tokens_needed = max(context_size - len(prefix_toks), 0)
+        tokens_needed = max(context_size_in - len(prefix_toks), 0)
         tokens_part = tokens[offset : offset + tokens_needed]
-        batch = torch.cat([*prefix_toks[:context_size], tokens_part])
+        batch = torch.cat([*prefix_toks[:context_size_in], tokens_part])
         return batch, offset + tokens_needed
     # if we're concatting batches, add the separator token as needed
     if sequence_separator_token_id is not None:
@@ -45,8 +45,8 @@ def _add_tokens_to_batch(
         if first_token != sequence_separator_token_id_tensor:
             prefix_toks.insert(0, sequence_separator_token_id_tensor)
             first_token = sequence_separator_token_id_tensor
-    tokens_needed = max(context_size - batch.shape[0] - len(prefix_toks), 0)
-    prefix_toks_needed = max(context_size - batch.shape[0], 0)
+    tokens_needed = max(context_size_in - batch.shape[0] - len(prefix_toks), 0)
+    prefix_toks_needed = max(context_size_in - batch.shape[0], 0)
     batch = torch.concat(
         [
             batch,
@@ -60,18 +60,18 @@ def _add_tokens_to_batch(
 @torch.no_grad()
 def concat_and_batch_sequences(
     tokens_iterator: Iterator[torch.Tensor],
-    context_size: int,
+    context_size_in: int,
     begin_batch_token_id: int | None = None,
     begin_sequence_token_id: int | None = None,
     sequence_separator_token_id: int | None = None,
 ) -> Generator[torch.Tensor, None, None]:
     """
     Generator to concat token sequences together from the tokens_interator, yielding
-    batches of size `context_size`.
+    batches of size `context_size_in`.
 
     Args:
         tokens_iterator: An iterator which returns a 1D tensors of tokens
-        context_size: Each batch will have this many tokens
+        context_size_in: Each batch will have this many tokens
         begin_batch_token_id: If provided, this token will be at position 0 of each batch
         begin_sequence_token_id: If provided, this token will be the first token of each sequence
         sequence_separator_token_id: If provided, this token will be inserted between concatenated sequences
@@ -90,13 +90,13 @@ def concat_and_batch_sequences(
                 batch=batch,
                 tokens=tokens,
                 offset=offset,
-                context_size=context_size,
+                context_size_in=context_size_in,
                 is_start_of_sequence=is_start_of_sequence,
                 begin_batch_token_id=begin_batch_token_id,
                 begin_sequence_token_id=begin_sequence_token_id,
                 sequence_separator_token_id=sequence_separator_token_id,
             )
             is_start_of_sequence = False
-            if batch.shape[0] == context_size:
+            if batch.shape[0] == context_size_in:
                 yield batch
                 batch = None

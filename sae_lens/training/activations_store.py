@@ -65,7 +65,8 @@ class ActivationsStore:
             dtype=cfg.dtype,
             hook_name=cfg.hook_name,
             hook_layer=cfg.hook_layer,
-            context_size=cfg.context_size,
+            context_size_in=cfg.context_size_in,
+            context_size_out=cfg.context_size_out,
             d_in=cfg.d_in,
             n_batches_in_buffer=cfg.n_batches_in_buffer,
             total_training_tokens=cfg.training_tokens,
@@ -115,7 +116,8 @@ class ActivationsStore:
             hook_name=cfg.hook_name,
             hook_layer=cfg.hook_layer,
             hook_head_index=cfg.hook_head_index,
-            context_size=cfg.context_size,
+            context_size_in=cfg.context_size_in,
+            context_size_out=cfg.context_size_out,
             d_in=cfg.d_in,
             n_batches_in_buffer=cfg.n_batches_in_buffer,
             total_training_tokens=cfg.training_tokens,
@@ -137,7 +139,8 @@ class ActivationsStore:
         cls,
         model: HookedRootModule,
         sae: SAE,
-        context_size: int | None = None,
+        context_size_in: int | None = None,
+        context_size_out: int | None = None,
         dataset: HfDataset | str | None = None,
         streaming: bool = True,
         store_batch_size_prompts: int = 8,
@@ -153,7 +156,8 @@ class ActivationsStore:
             hook_name=sae.cfg.hook_name,
             hook_layer=sae.cfg.hook_layer,
             hook_head_index=sae.cfg.hook_head_index,
-            context_size=sae.cfg.context_size if context_size is None else context_size,
+            context_size_in=sae.cfg.context_size_in if context_size_in is None else context_size_in,
+            context_size_out=sae.cfg.context_size_out if context_size_out is None else context_size_out,
             prepend_bos=sae.cfg.prepend_bos,
             streaming=streaming,
             store_batch_size_prompts=store_batch_size_prompts,
@@ -175,7 +179,8 @@ class ActivationsStore:
         hook_name: str,
         hook_layer: int,
         hook_head_index: int | None,
-        context_size: int,
+        context_size_in: int,
+        context_size_out: int,
         d_in: int,
         n_batches_in_buffer: int,
         total_training_tokens: int,
@@ -218,7 +223,8 @@ class ActivationsStore:
         self.hook_name = hook_name
         self.hook_layer = hook_layer
         self.hook_head_index = hook_head_index
-        self.context_size = context_size
+        self.context_size_in = context_size_in
+        self.context_size_out = context_size_out
         self.d_in = d_in
         self.n_batches_in_buffer = n_batches_in_buffer
         self.half_buffer_size = n_batches_in_buffer // 2
@@ -259,14 +265,14 @@ class ActivationsStore:
             )
         if self.is_dataset_tokenized:
             ds_context_size = len(dataset_sample[self.tokens_column])
-            if ds_context_size < self.context_size:
+            if ds_context_size < self.context_size_in:
                 raise ValueError(
-                    f"""pretokenized dataset has context_size {ds_context_size}, but the provided context_size is {self.context_size}.
-                    The context_size {ds_context_size} is expected to be larger than or equal to the provided context size {self.context_size}."""
+                    f"""pretokenized dataset has context_size {ds_context_size}, but the provided context_size is {self.context_size_in}.
+                    The context_size {ds_context_size} is expected to be larger than or equal to the provided context size {self.context_size_in}."""
                 )
-            if self.context_size != ds_context_size:
+            if self.context_size_in != ds_context_size:
                 warnings.warn(
-                    f"""pretokenized dataset has context_size {ds_context_size}, but the provided context_size is {self.context_size}. Some data will be discarded in this case.""",
+                    f"""pretokenized dataset has context_size {ds_context_size}, but the provided context_size is {self.context_size_in}. Some data will be discarded in this case.""",
                     RuntimeWarning,
                 )
             # TODO: investigate if this can work for iterable datasets, or if this is even worthwhile as a perf improvement
@@ -325,7 +331,7 @@ class ActivationsStore:
 
     def _iterate_tokenized_sequences(self) -> Generator[torch.Tensor, None, None]:
         """
-        Generator which iterates over full sequence of context_size tokens
+        Generator which iterates over full sequence of context_size_in tokens
         """
         # If the datset is pretokenized, we will slice the dataset to the length of the context window if needed. Otherwise, no further processing is needed.
         # We assume that all necessary BOS/EOS/SEP tokens have been added during pretokenization.
@@ -333,8 +339,8 @@ class ActivationsStore:
             for row in self._iterate_raw_dataset():
                 yield torch.tensor(
                     row[
-                        : self.context_size
-                    ],  # If self.context_size = None, this line simply returns the whole row
+                        : self.context_size_in
+                    ],  # If self.context_size_in = None, this line simply returns the whole row
                     dtype=torch.long,
                     device=self.device,
                     requires_grad=False,
@@ -345,7 +351,7 @@ class ActivationsStore:
             bos_token_id = None if tokenizer is None else tokenizer.bos_token_id
             yield from concat_and_batch_sequences(
                 tokens_iterator=self._iterate_raw_dataset_tokens(),
-                context_size=self.context_size,
+                context_size_in=self.context_size_in,
                 begin_batch_token_id=(bos_token_id if self.prepend_bos else None),
                 begin_sequence_token_id=None,
                 sequence_separator_token_id=(
@@ -387,11 +393,11 @@ class ActivationsStore:
             )
 
         if activations_dataset.features[self.hook_name].shape != (
-            self.context_size,
+            self.context_size_out,
             self.d_in,
         ):
             raise ValueError(
-                f"Given dataset of shape {activations_dataset.features[self.hook_name].shape} does not match context_size ({self.context_size}) and d_in ({self.d_in})"
+                f"Given dataset of shape {activations_dataset.features[self.hook_name].shape} does not match context_size_out ({self.context_size_out}) and d_in ({self.d_in})"
             )
 
         return activations_dataset
@@ -475,7 +481,7 @@ class ActivationsStore:
         if not batch_size:
             batch_size = self.store_batch_size_prompts
         sequences = []
-        # the sequences iterator yields fully formed tokens of size context_size, so we just need to cat these into a batch
+        # the sequences iterator yields fully formed tokens of size context_size_in, so we just need to cat these into a batch
         for _ in range(batch_size):
             try:
                 sequences.append(next(self.iterable_sequences))
@@ -565,16 +571,16 @@ class ActivationsStore:
     def _load_buffer_from_cached(
         self,
         total_size: int,
-        context_size: int,
+        context_size_out: int,
         num_layers: int,
         d_in: int,
         raise_on_epoch_end: bool,
-    ) -> Float[torch.Tensor, "(total_size context_size) num_layers d_in"]:
+    ) -> Float[torch.Tensor, "(total_size context_size_out) num_layers d_in"]:
         """
         Loads `total_size` activations from `cached_activation_dataset`
 
         The dataset has columns for each hook_name,
-        each containing activations of shape (context_size, d_in).
+        each containing activations of shape (context_size_out, d_in).
 
         raises StopIteration
         """
@@ -595,16 +601,16 @@ class ActivationsStore:
             _hook_buffer = self.cached_activation_dataset[
                 self.current_row_idx : self.current_row_idx + total_size
             ][hook_name]
-            assert _hook_buffer.shape == (total_size, context_size, d_in)
+            assert _hook_buffer.shape == (total_size, context_size_out, d_in)
             new_buffer.append(_hook_buffer)
 
         # Stack across num_layers dimension
-        # list of num_layers; shape: (total_size, context_size, d_in) -> (total_size, context_size, num_layers, d_in)
+        # list of num_layers; shape: (total_size, context_size_out, d_in) -> (total_size, context_size_out, num_layers, d_in)
         new_buffer = torch.stack(new_buffer, dim=2)
-        assert new_buffer.shape == (total_size, context_size, num_layers, d_in)
+        assert new_buffer.shape == (total_size, context_size_out, num_layers, d_in)
 
         self.current_row_idx += total_size
-        return new_buffer.reshape(total_size * context_size, num_layers, d_in)
+        return new_buffer.reshape(total_size * context_size_out, num_layers, d_in)
 
     @torch.no_grad()
     def get_buffer(
@@ -620,8 +626,8 @@ class ActivationsStore:
 
         If raise_on_epoch_end is True, when the dataset it exhausted it will automatically refill the dataset and then raise a StopIteration so that the caller has a chance to react.
         """
-        context_size = self.context_size
-        training_context_size = len(range(context_size)[slice(*self.seqpos_slice)])
+        context_size_out = self.context_size_out
+        training_context_size = len(range(context_size_out)[slice(*self.seqpos_slice)])
         batch_size = self.store_batch_size_prompts
         d_in = self.d_in
         total_size = batch_size * n_batches_in_buffer
@@ -629,7 +635,7 @@ class ActivationsStore:
 
         if self.cached_activation_dataset is not None:
             return self._load_buffer_from_cached(
-                total_size, context_size, num_layers, d_in, raise_on_epoch_end
+                total_size, context_size_out, num_layers, d_in, raise_on_epoch_end
             )
 
         refill_iterator = range(0, total_size, batch_size)

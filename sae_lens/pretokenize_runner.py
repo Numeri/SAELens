@@ -27,7 +27,7 @@ class PretokenizedDatasetMetadata:
     original_dataset: str
     original_split: str | None
     original_data_files: list[str] | None
-    context_size: int
+    context_size_in: int
     shuffled: bool
     seed: int | None
     begin_batch_token: int | Literal["bos", "eos", "sep"] | None
@@ -42,7 +42,7 @@ def metadata_from_config(cfg: PretokenizeRunnerConfig) -> PretokenizedDatasetMet
         original_dataset=cfg.dataset_path,
         original_split=cfg.split,
         original_data_files=cfg.data_files,
-        context_size=cfg.context_size,
+        context_size_in=cfg.context_size_in,
         shuffled=cfg.shuffle,
         seed=cfg.seed,
         begin_batch_token=cfg.begin_batch_token,
@@ -85,7 +85,7 @@ def pretokenize_dataset(
             "input_ids": list(
                 concat_and_batch_sequences(
                     tokens_iterator=tokens_iterator,
-                    context_size=cfg.context_size,
+                    context_size_in=cfg.context_size_in,
                     begin_batch_token_id=get_special_token_from_cfg(
                         cfg.begin_batch_token, tokenizer
                     ),

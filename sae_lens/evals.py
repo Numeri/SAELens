@@ -251,13 +251,13 @@ def run_evals(
             sae.turn_off_forward_pass_hook_z_reshaping()
 
     total_tokens_evaluated_eval_reconstruction = (
-        activation_store.context_size
+        activation_store.context_size_out
         * eval_config.n_eval_reconstruction_batches
         * actual_batch_size
     )
 
     total_tokens_evaluated_eval_sparsity_variance = (
-        activation_store.context_size
+        activation_store.context_size_out
         * eval_config.n_eval_sparsity_variance_batches
         * actual_batch_size
     )
@@ -782,7 +782,7 @@ def multiple_evals(
     n_eval_sparsity_variance_batches: int,
     eval_batch_size_prompts: int = 8,
     datasets: list[str] = ["Skylion007/openwebtext", "lighteval/MATH"],
-    ctx_lens: list[int] = [128],
+    ctx_lens: list[tuple[int, int]] = [(128, 128)],
     output_dir: str = "eval_results",
     verbose: bool = False,
 ) -> List[Dict[str, Any]]:
@@ -823,10 +823,14 @@ def multiple_evals(
             )
         assert current_model is not None
 
-        for ctx_len in ctx_lens:
+        for ctx_len_in, ctx_len_out in ctx_lens:
             for dataset in datasets:
                 activation_store = ActivationsStore.from_sae(
-                    current_model, sae, context_size=ctx_len, dataset=dataset
+                    current_model,
+                    sae,
+                    context_size_in=ctx_len_in,
+                    context_size_out=ctx_len_out,
+                    dataset=dataset,
                 )
                 activation_store.shuffle_input_dataset(seed=42)
 
@@ -834,7 +838,8 @@ def multiple_evals(
                 eval_metrics["unique_id"] = f"{sae_release_name}-{sae_id}"
                 eval_metrics["sae_set"] = f"{sae_release_name}"
                 eval_metrics["sae_id"] = f"{sae_id}"
-                eval_metrics["eval_cfg"]["context_size"] = ctx_len
+                eval_metrics["eval_cfg"]["context_size_in"] = ctx_len_in
+                eval_metrics["eval_cfg"]["context_size_out"] = ctx_len_out
                 eval_metrics["eval_cfg"]["dataset"] = dataset
                 eval_metrics["eval_cfg"]["library_version"] = (
                     eval_config.library_version
@@ -914,7 +919,7 @@ def process_results(
 
     # Save individual JSON files
     for result in cleaned_results:
-        json_filename = f"{result['unique_id']}_{result['eval_cfg']['context_size']}_{result['eval_cfg']['dataset']}.json".replace(
+        json_filename = f"{result['unique_id']}_{result['eval_cfg']['context_size_out']}_{result['eval_cfg']['dataset']}.json".replace(
             "/", "_"
         )
         json_path = output_path / json_filename

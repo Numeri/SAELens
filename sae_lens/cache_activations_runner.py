@@ -34,7 +34,8 @@ def _mk_activations_store(
         hook_name=cfg.hook_name,
         hook_layer=cfg.hook_layer,
         hook_head_index=None,
-        context_size=cfg.context_size,
+        context_size_in=cfg.context_size_in,
+        context_size_out=cfg.context_size_out,
         d_in=cfg.d_in,
         n_batches_in_buffer=cfg.n_batches_in_buffer,
         total_training_tokens=cfg.training_tokens,
@@ -67,13 +68,13 @@ class CacheActivationsRunner:
             self.model,
             self.cfg,
         )
-        self.context_size = self._get_sliced_context_size(
-            self.cfg.context_size, self.cfg.seqpos_slice
+        self.context_size_out = self._get_sliced_context_size_out(
+            self.cfg.context_size_out, self.cfg.seqpos_slice
         )
         self.features = Features(
             {
                 hook_name: Array2D(
-                    shape=(self.context_size, self.cfg.d_in), dtype=self.cfg.dtype
+                    shape=(self.context_size_out, self.cfg.d_in), dtype=self.cfg.dtype
                 )
                 for hook_name in [self.cfg.hook_name]
             }
@@ -92,7 +93,7 @@ class CacheActivationsRunner:
             if isinstance(self.cfg.dtype, torch.dtype)
             else DTYPE_MAP[self.cfg.dtype].itemsize
         )
-        total_training_tokens = self.cfg.n_seq_in_dataset * self.context_size
+        total_training_tokens = self.cfg.n_seq_in_dataset * self.context_size_out
         total_disk_space_gb = total_training_tokens * bytes_per_token / 10**9
 
         return (
@@ -300,15 +301,15 @@ class CacheActivationsRunner:
 
     def _create_shard(
         self,
-        buffer: Float[torch.Tensor, "(bs context_size) num_layers d_in"],
+        buffer: Float[torch.Tensor, "(bs context_size_out) num_layers d_in"],
     ) -> Dataset:
         hook_names = [self.cfg.hook_name]
 
         buffer = einops.rearrange(
             buffer,
-            "(bs context_size) num_layers d_in -> num_layers bs context_size d_in",
+            "(bs context_size_out) num_layers d_in -> num_layers bs context_size_out d_in",
             bs=self.cfg.n_seq_in_buffer,
-            context_size=self.context_size,
+            context_size_out=self.context_size_out,
             d_in=self.cfg.d_in,
             num_layers=len(hook_names),
         )
@@ -318,9 +319,9 @@ class CacheActivationsRunner:
         )
 
     @staticmethod
-    def _get_sliced_context_size(
-        context_size: int, seqpos_slice: tuple[int | None, ...] | None
+    def _get_sliced_context_size_out(
+        context_size_out: int, seqpos_slice: tuple[int | None, ...] | None
     ) -> int:
         if seqpos_slice is not None:
-            context_size = len(range(context_size)[slice(*seqpos_slice)])
-        return context_size
+            context_size_out = len(range(context_size_out)[slice(*seqpos_slice)])
+        return context_size_out

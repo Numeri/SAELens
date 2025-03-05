@@ -47,7 +47,8 @@ class LanguageModelSAERunnerConfig:
         dataset_trust_remote_code (bool): Whether to trust remote code when loading datasets from Huggingface.
         streaming (bool): Whether to stream the dataset. Streaming large datasets is usually practical.
         is_dataset_tokenized (bool): NOT IN USE. We used to use this but now automatically detect if the dataset is tokenized.
-        context_size (int): The context size to use when generating activations on which to train the SAE.
+        context_size_in (int): The context size of the input used to generate activations.
+        context_size_out (int): The context size produced by the model – the size on which the SAE will be trained.
         use_cached_activations (bool): Whether to use cached activations. This is useful when doing sweeps over the same activations.
         cached_activations_path (str, optional): The path to the cached activations.
         d_in (int): The input dimension of the SAE.
@@ -65,7 +66,7 @@ class LanguageModelSAERunnerConfig:
         n_batches_in_buffer (int): The number of batches in the buffer. When not using cached activations, a buffer in ram is used. The larger it is, the better shuffled the activations will be.
         training_tokens (int): The number of training tokens.
         finetuning_tokens (int): The number of finetuning tokens. See [here](https://www.lesswrong.com/posts/3JuSjTZyMzaSeTxKk/addressing-feature-suppression-in-saes)
-        store_batch_size_prompts (int): The batch size for storing activations. This controls how many prompts are in the batch of the language model when generating actiations.
+        store_batch_size_prompts (int): The batch size for storing activations. This controls how many prompts are in the batch of the language model when generating activations.
         train_batch_size_tokens (int): The batch size for training. This controls the batch size of the SAE Training loop.
         normalize_activations (str): Activation Normalization Strategy. Either none, expected_average_only_in (estimate the average activation norm and divide activations by it following Antrhopic April update -> this can be folded post training and set to None), or constant_norm_rescale (at runtime set activation norm to sqrt(d_in) and then scale up the SAE output).
         seqpos_slice (tuple): Determines slicing of activations when constructing batches during training. The slice should be (start_pos, end_pos, optional[step_size]), e.g. for Othello we sometimes use (5, -5). Note, step_size > 0.
@@ -130,7 +131,8 @@ class LanguageModelSAERunnerConfig:
     dataset_trust_remote_code: bool = True
     streaming: bool = True
     is_dataset_tokenized: bool = True
-    context_size: int = 128
+    context_size_in: int = 128
+    context_size_out: int = 128
     use_cached_activations: bool = False
     cached_activations_path: Optional[str] = (
         None  # Defaults to "activations/{dataset}/{model}/{full_hook_name}_{hook_head_index}"
@@ -183,9 +185,6 @@ class LanguageModelSAERunnerConfig:
     sae_compilation_mode: str | None = None
 
     # Training Parameters
-
-    ## Batch size
-    train_batch_size_tokens: int = 4096
 
     ## Adam
     adam_beta1: float = 0
@@ -283,7 +282,7 @@ class LanguageModelSAERunnerConfig:
         if self.d_sae is None and self.expansion_factor is not None:
             self.d_sae = self.d_in * self.expansion_factor
         self.tokens_per_buffer = (
-            self.train_batch_size_tokens * self.context_size * self.n_batches_in_buffer
+            self.train_batch_size_tokens * self.n_batches_in_buffer
         )
 
         if self.run_name is None:
@@ -346,7 +345,7 @@ class LanguageModelSAERunnerConfig:
             # Print out some useful info:
             n_tokens_per_buffer = (
                 self.store_batch_size_prompts
-                * self.context_size
+                * self.context_size_out
                 * self.n_batches_in_buffer
             )
             logger.info(
@@ -373,10 +372,10 @@ class LanguageModelSAERunnerConfig:
                 total_training_steps // self.feature_sampling_window
             )
             logger.info(
-                f"n_tokens_per_feature_sampling_window (millions): {(self.feature_sampling_window * self.context_size * self.train_batch_size_tokens) / 10 ** 6}"
+                f"n_tokens_per_feature_sampling_window (millions): {(self.feature_sampling_window * self.context_size_out * self.train_batch_size_tokens) / 10 ** 6}"
             )
             logger.info(
-                f"n_tokens_per_dead_feature_window (millions): {(self.dead_feature_window * self.context_size * self.train_batch_size_tokens) / 10 ** 6}"
+                f"n_tokens_per_dead_feature_window (millions): {(self.dead_feature_window * self.context_size_out * self.train_batch_size_tokens) / 10 ** 6}"
             )
             logger.info(
                 f"We will reset the sparsity calculation {n_feature_window_samples} times."
@@ -389,12 +388,17 @@ class LanguageModelSAERunnerConfig:
         if self.use_ghost_grads:
             logger.info("Using Ghost Grads.")
 
-        if self.context_size < 0:
+        if self.context_size_in < 0:
             raise ValueError(
-                f"The provided context_size is {self.context_size} is negative. Expecting positive context_size."
+                f"The provided context_size_in is {self.context_size_in} is negative. Expecting positive context_size."
             )
 
-        _validate_seqpos(seqpos=self.seqpos_slice, context_size=self.context_size)
+        if self.context_size_out < 0:
+            raise ValueError(
+                f"The provided context_size_out is {self.context_size_out} is negative. Expecting positive context_size."
+            )
+
+        _validate_seqpos(seqpos=self.seqpos_slice, context_size_out=self.context_size_out)
 
     @property
     def total_training_tokens(self) -> int:
@@ -418,7 +422,8 @@ class LanguageModelSAERunnerConfig:
             "hook_head_index": self.hook_head_index,
             "activation_fn_str": self.activation_fn,
             "apply_b_dec_to_input": self.apply_b_dec_to_input,
-            "context_size": self.context_size,
+            "context_size_in": self.context_size_in,
+            "context_size_out": self.context_size_out,
             "prepend_bos": self.prepend_bos,
             "dataset_path": self.dataset_path,
             "dataset_trust_remote_code": self.dataset_trust_remote_code,
@@ -493,7 +498,8 @@ class CacheActivationsRunnerConfig:
         hook_layer (int): The layer of the final hook. Currently only support a single hook, so this should be the same as hook_name.
         d_in (int): Dimension of the model.
         total_training_tokens (int): Total number of tokens to process.
-        context_size (int): Context size to process. Can be left as -1 if the dataset is tokenized.
+        context_size_in (int | None): The context size of the input used to generate activations. Can be None if the dataset is tokenized.
+        context_size_out (int | None): The context size produced by the model – the size on which the SAE will be trained. Can be None if identical to context_size_in.
         model_class_name (str): The name of the class of the model to use. This should be either `HookedTransformer` or `HookedMamba`.
         new_cached_activations_path (str, optional): The path to save the activations.
         shuffle (bool): Whether to shuffle the dataset.
@@ -524,7 +530,8 @@ class CacheActivationsRunnerConfig:
     d_in: int
     training_tokens: int
 
-    context_size: int = -1  # Required if dataset is not tokenized
+    context_size_in: int | None = None  # Required if dataset is not tokenized
+    context_size_out: int | None = None  # Required if context_size_out is different from context_size_in
     model_class_name: str = "HookedTransformer"
     # defaults to "activations/{dataset}/{model}/{hook_name}
     new_cached_activations_path: str | None = None
@@ -554,24 +561,29 @@ class CacheActivationsRunnerConfig:
     dataset_trust_remote_code: bool | None = None
 
     def __post_init__(self):
-        # Automatically determine context_size if dataset is tokenized
-        if self.context_size == -1:
+        # Automatically determine context_size_in if dataset is tokenized
+        if self.context_size_in is None:
             ds = load_dataset(self.dataset_path, split="train", streaming=True)
             assert isinstance(ds, IterableDataset)
             first_sample = next(iter(ds))
             toks = first_sample.get("tokens") or first_sample.get("input_ids") or None
             if toks is None:
                 raise ValueError(
-                    "Dataset is not tokenized. Please specify context_size."
+                    "Dataset is not tokenized. Please specify context_size_in."
                 )
             token_length = len(toks)
-            self.context_size = token_length
-        assert self.context_size != -1
+            self.context_size_in = token_length
+        assert self.context_size_in is not None
+
+        # Automatically determine context_size_out if not specified
+        if self.context_size_out is None:
+            self.context_size_out = self.context_size_in
+        assert self.context_size_out is not None
 
         if self.seqpos_slice is not None:
             _validate_seqpos(
                 seqpos=self.seqpos_slice,
-                context_size=self.context_size,
+                context_size_out=self.context_size_out,
             )
 
         if self.new_cached_activations_path is None:
@@ -580,10 +592,10 @@ class CacheActivationsRunnerConfig:
             )
 
     @property
-    def sliced_context_size(self) -> int:
+    def sliced_context_size_out(self) -> int:
         if self.seqpos_slice is not None:
-            return len(range(self.context_size)[slice(*self.seqpos_slice)])
-        return self.context_size
+            return len(range(self.context_size_out)[slice(*self.seqpos_slice)])
+        return self.context_size_out
 
     @property
     def bytes_per_token(self) -> int:
@@ -598,7 +610,7 @@ class CacheActivationsRunnerConfig:
 
     @property
     def n_tokens_in_batch(self) -> int:
-        return self.model_batch_size * self.sliced_context_size
+        return self.model_batch_size * self.sliced_context_size_out
 
     @property
     def n_batches_in_buffer(self) -> int:
@@ -606,11 +618,11 @@ class CacheActivationsRunnerConfig:
 
     @property
     def n_seq_in_dataset(self) -> int:
-        return self.training_tokens // self.sliced_context_size
+        return self.training_tokens // self.sliced_context_size_out
 
     @property
     def n_seq_in_buffer(self) -> int:
-        return self.n_tokens_in_buffer // self.sliced_context_size
+        return self.n_tokens_in_buffer // self.sliced_context_size_out
 
     @property
     def n_buffers(self) -> int:
@@ -700,7 +712,7 @@ def _default_cached_activations_path(
     return path
 
 
-def _validate_seqpos(seqpos: tuple[int | None, ...], context_size: int) -> None:
+def _validate_seqpos(seqpos: tuple[int | None, ...], context_size_out: int) -> None:
     # Ensure that the step-size is larger or equal to 1
     if len(seqpos) == 3:
         step_size = seqpos[2] or 1
@@ -708,7 +720,7 @@ def _validate_seqpos(seqpos: tuple[int | None, ...], context_size: int) -> None:
             step_size > 1
         ), f"Ensure the step_size {seqpos[2]=} for sequence slicing is positive."
     # Ensure that the choice of seqpos doesn't end up with an empty list
-    assert len(list(range(context_size))[slice(*seqpos)]) > 0
+    assert len(list(range(context_size_out))[slice(*seqpos)]) > 0
 
 
 @dataclass
@@ -720,7 +732,8 @@ class PretokenizeRunnerConfig:
     data_files: list[str] | None = None
     data_dir: str | None = None
     num_proc: int = 4
-    context_size: int = 128
+    context_size_in: int = 128
+    context_size_out: int = 128
     column_name: str = "text"
     shuffle: bool = True
     seed: int | None = None
