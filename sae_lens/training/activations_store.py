@@ -493,17 +493,20 @@ class ActivationsStore:
                     )
                 sequences.append(next(self.iterable_sequences))
 
-        return torch.stack(sequences, dim=0).to(_get_model_device(self.model))
+        batch_tokens = torch.stack(sequences, dim=0)
+        if self.model.tokenizer.pad_token is not None:
+            pad_id = self.model.tokenizer.convert_tokens_to_ids(self.model.tokenizer.pad_token)
+            max_pad_idx = (batch_tokens == pad_id).int().argmax(dim=1).max()
+            batch_tokens = batch_tokens[:, :max_pad_idx]
+        batch_tokens = batch_tokens.to(_get_model_device(self.model), non_blocking=True)
+
+        return batch_tokens
 
     @torch.no_grad()
     def get_activations(self, batch_tokens: torch.Tensor):
-        """
-        Returns activations of shape (batches, context, num_layers, d_in)
-
-        d_in may result from a concatenated head dimension.
-        """
-
-        # Setup autocast if using
+        # ----------------------
+        # 1) Run your model hook
+        # ----------------------
         if self.autocast_lm:
             autocast_if_enabled = torch.autocast(
                 device_type="cuda",
@@ -514,11 +517,8 @@ class ActivationsStore:
             autocast_if_enabled = contextlib.nullcontext()
 
         with autocast_if_enabled:
-            if self.model.tokenizer.pad_token is not None:
-                pad_id = self.model.tokenizer.convert_tokens_to_ids(self.model.tokenizer.pad_token)
-                max_pad_idx = (batch_tokens == pad_id).int().argmax(dim=1).max()
-                batch_tokens = batch_tokens[:, :max_pad_idx]
-            layerwise_activations_cache = self.model.run_with_cache(
+            # run_with_cache returns (output, cache), so [1] is the cache:
+            cache = self.model.run_with_cache(
                 batch_tokens,
                 names_filter=[self.hook_name],
                 stop_at_layer=self.hook_layer + 1,
@@ -526,47 +526,61 @@ class ActivationsStore:
                 **self.model_kwargs,
             )[1]
 
-        layerwise_activations = layerwise_activations_cache[self.hook_name][
-            :, slice(*self.seqpos_slice)
-        ]
+        layerwise_activations = cache[self.hook_name][:, slice(*self.seqpos_slice)]
+        # shape is typically (n_batches, seq_len, <possibly heads>, hidden_size)
 
-        n_batches, n_context = layerwise_activations.shape[:2]
-
-        activation_shape = layerwise_activations.shape
-        if (
-            len(activation_shape) == 2
-            and activation_shape[0] == n_batches
-            and activation_shape[1] == self.d_in
-        ):
-            # If we have only one token instead of the whole context
-            # such as with encoder class tokens
-            n_context = 1
-
-        stacked_activations = torch.zeros((n_batches, n_context, 1, self.d_in))
-
+        # ----------------------
+        # 2) Collapse head dims if requested
+        # ----------------------
         if self.hook_head_index is not None:
-            stacked_activations[:, :, 0] = layerwise_activations[
-                :, :, self.hook_head_index
-            ]
-        elif len(activation_shape) > 3:
-            # if we have a head dimension
-            try:
-                stacked_activations[:, :, 0] = layerwise_activations.view(
-                    n_batches, n_context, -1
-                )
-            except RuntimeError as e:
-                logger.error(f"Error during view operation: {e}")
-                logger.info("Attempting to use reshape instead...")
-                stacked_activations[:, :, 0] = layerwise_activations.reshape(
-                    n_batches, n_context, -1
-                )
-        elif len(activation_shape) == 2 and n_context == 1:
-            # If we have a single token
-            stacked_activations[:, 0, 0] = layerwise_activations
-        else:
-            stacked_activations[:, :, 0] = layerwise_activations
+            # e.g. shape => (n_batches, seq_len, hidden_size)
+            layerwise_activations = layerwise_activations[:, :, self.hook_head_index]
+        elif layerwise_activations.dim() > 3:
+            # flatten any multi-head dimension => (n_batches, seq_len, d_in)
+            layerwise_activations = layerwise_activations.reshape(
+                layerwise_activations.size(0),
+                layerwise_activations.size(1),
+                -1,
+            )
 
-        return stacked_activations
+        # By now we hope for shape either (n_batches, seq_len, d_in)
+        # or possibly (n_batches, d_in) if seq_len=1 got squeezed out.
+
+        # ----------------------
+        # 3) Fix any unexpected dimension ordering
+        # ----------------------
+        # If we genuinely have 3D but the middle dimension is huge and the last dimension is 1,
+        # that often means we got (n_batches, d_in, 1) instead of (n_batches, 1, d_in).
+        if layerwise_activations.dim() == 3:
+            b, d1, d2 = layerwise_activations.shape
+            # Suppose we see (32, 3072, 1) but want (32, 1, 3072):
+            if d2 == 1 and d1 > 1:
+                layerwise_activations = layerwise_activations.permute(0, 2, 1)
+                # Now it’s (32, 1, 3072)
+
+        # ----------------------
+        # 4) Handle the single-token path (dim == 2 or shape[1] == 1)
+        # ----------------------
+        if layerwise_activations.dim() == 2:
+            # e.g. shape (n_batches, d_in) or (n_batches, seq_len=1)
+            # => Expand to (n_batches, 1, 1, d_in)
+            # 
+            # If we’re sure seq_len=1, then
+            # shape is (n_batches, d_in), so just unsqueeze:
+            layerwise_activations = layerwise_activations.unsqueeze(1).unsqueeze(2)
+            # => (n_batches, 1, 1, d_in)
+
+        elif layerwise_activations.dim() == 3:
+            # shape (n_batches, seq_len, d_in). If seq_len=1, that’s your single-token case:
+            if layerwise_activations.shape[1] == 1:
+                # Insert the 'layer' dimension => (n_batches, 1, 1, d_in)
+                layerwise_activations = layerwise_activations.unsqueeze(2)
+            else:
+                # Multi-token case => (n_batches, seq_len, d_in) => (n_batches, seq_len, 1, d_in)
+                layerwise_activations = layerwise_activations.unsqueeze(2)
+
+        # Now final shape should be (n_batches, seq_len, 1, d_in) or (n_batches, 1, 1, d_in)
+        return layerwise_activations
 
     def _load_buffer_from_cached(
         self,
@@ -618,13 +632,16 @@ class ActivationsStore:
         n_batches_in_buffer: int,
         raise_on_epoch_end: bool = False,
         shuffle: bool = True,
-    ) -> torch.Tensor:
+        fast_forward: bool = False,
+    ) -> torch.Tensor | None:
         """
         Loads the next n_batches_in_buffer batches of activations into a tensor and returns half of it.
 
         The primary purpose here is maintaining a shuffling buffer.
 
         If raise_on_epoch_end is True, when the dataset it exhausted it will automatically refill the dataset and then raise a StopIteration so that the caller has a chance to react.
+
+        If fast_forward is True, the dataset will be consumed for n_batches_in_buffer batches without calculating activations, returning None. This is useful for quickly advancing the dataset to a specific point.
         """
         context_size_out = self.context_size_out
         training_context_size = len(range(context_size_out)[slice(*self.seqpos_slice)])
@@ -639,11 +656,19 @@ class ActivationsStore:
             )
 
         refill_iterator = range(0, total_size, batch_size)
+        if fast_forward:
+            for _ in tqdm(
+                refill_iterator, leave=False, desc="Fast forwarding buffer"
+            ):
+                self.get_batch_tokens(raise_at_epoch_end=raise_on_epoch_end)
+            return None
+
         # Initialize empty tensor buffer of the maximum required size with an additional dimension for layers
         new_buffer = torch.zeros(
             (total_size, training_context_size, num_layers, d_in),
             dtype=self.dtype,  # type: ignore
             device=self.device,
+            pin_memory=(self.device.type == "cpu"),
         )
 
         for refill_batch_idx_start in tqdm(
@@ -652,10 +677,10 @@ class ActivationsStore:
             # move batch toks to gpu for model
             refill_batch_tokens = self.get_batch_tokens(
                 raise_at_epoch_end=raise_on_epoch_end
-            ).to(_get_model_device(self.model))
+            ).to(_get_model_device(self.model), non_blocking=True)
             refill_activations = self.get_activations(refill_batch_tokens)
             # move acts back to cpu
-            refill_activations.to(self.device)
+            refill_activations = refill_activations.to(self.device, non_blocking=True)
             new_buffer[
                 refill_batch_idx_start : refill_batch_idx_start + batch_size, ...
             ] = refill_activations

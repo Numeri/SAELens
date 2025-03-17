@@ -502,6 +502,7 @@ class CacheActivationsRunnerConfig:
         context_size_out (int | None): The context size produced by the model – the size on which the SAE will be trained. Can be None if identical to context_size_in.
         model_class_name (str): The name of the class of the model to use. This should be either `HookedTransformer` or `HookedMamba`.
         new_cached_activations_path (str, optional): The path to save the activations.
+        allow_resume (bool): Whether to allow resuming from a previous run. Default is False.
         shuffle (bool): Whether to shuffle the dataset.
         seed (int): The seed to use for shuffling.
         dtype (str): Datatype of activations to be stored.
@@ -535,6 +536,7 @@ class CacheActivationsRunnerConfig:
     model_class_name: str = "HookedTransformer"
     # defaults to "activations/{dataset}/{model}/{hook_name}
     new_cached_activations_path: str | None = None
+    allow_resume: bool = False
     shuffle: bool = True
     seed: int = 42
     dtype: str = "float32"

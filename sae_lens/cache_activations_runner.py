@@ -223,7 +223,7 @@ class CacheActivationsRunner:
         if not copy_files:  # cleanup source dir
             shutil.rmtree(source_dir)
 
-        return Dataset.load_from_disk(output_dir)
+        return Dataset.load_from_disk(str(output_dir))
 
     @torch.no_grad()
     def run(self) -> Dataset:
@@ -233,23 +233,37 @@ class CacheActivationsRunner:
         ### Paths setup
         final_cached_activation_path = Path(activation_save_path)
         final_cached_activation_path.mkdir(exist_ok=True, parents=True)
-        if any(final_cached_activation_path.iterdir()):
-            raise Exception(
-                f"Activations directory ({final_cached_activation_path}) is not empty. Please delete it or specify a different path. Exiting the script to prevent accidental deletion of files."
-            )
+        existing_files = any(final_cached_activation_path.iterdir())
+        if existing_files:
+            if self.cfg.allow_resume:
+                logger.info(
+                    f"Resuming caching activations for {self.cfg.dataset_path} at {final_cached_activation_path}"
+                )
+            else:
+                raise Exception(
+                    f"Activations directory ({final_cached_activation_path}) is not empty. Please delete it or specify a different path. Exiting the script to prevent accidental deletion of files."
+                )
 
         tmp_cached_activation_path = final_cached_activation_path / ".tmp_shards/"
-        tmp_cached_activation_path.mkdir(exist_ok=False, parents=False)
+        tmp_cached_activation_path.mkdir(exist_ok=self.cfg.allow_resume, parents=False)
 
         ### Create temporary sharded datasets
 
         logger.info(f"Started caching activations for {self.cfg.dataset_path}")
 
         for i in tqdm(range(self.cfg.n_buffers), desc="Caching activations"):
+            shard_path = tmp_cached_activation_path / f"shard_{i:05d}"
             try:
+                if self.cfg.allow_resume and shard_path.exists():
+                    self.activations_store.get_buffer(
+                        self.cfg.n_batches_in_buffer, shuffle=False, fast_forward=True,
+                    )
+
+                    continue
                 buffer = self.activations_store.get_buffer(
-                    self.cfg.n_batches_in_buffer, shuffle=False
+                    self.cfg.n_batches_in_buffer, shuffle=False, fast_forward=False,
                 )
+                assert buffer is not None
                 shard = self._create_shard(buffer)
                 shard.save_to_disk(
                     f"{tmp_cached_activation_path}/shard_{i:05d}", num_shards=1
