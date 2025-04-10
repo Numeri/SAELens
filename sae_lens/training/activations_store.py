@@ -413,7 +413,7 @@ class ActivationsStore:
         if USE_DATASETS:
             shape = activations_dataset[self.hook_name].shape
         else:
-            shape = activations_dataset.columns[self.hook_name]['shape']
+            shape = tuple(activations_dataset.columns[self.hook_name]['shape'])
 
         if shape != (
             self.context_size_out,

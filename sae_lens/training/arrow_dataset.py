@@ -166,8 +166,6 @@ class ArrowDataset:
             for row, data_idx in zip(rows.columns[0], data_indices):
                 data[data_idx, :] = torch.from_numpy(row[0].values.to_numpy()).to(dtype=self.dtype, device=self.device)
 
-        data.squeeze_()
-
         return data
 
     def _get_rows(self, file_idx: int, rows: list[int]) -> pa.Table:
