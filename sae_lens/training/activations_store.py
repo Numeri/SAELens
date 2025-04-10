@@ -3,12 +3,14 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import pathlib
 import warnings
 from collections.abc import Generator, Iterator
 from typing import Any, Literal, cast
 
 import datasets
 import numpy as np
+import pyarrow
 import torch
 from datasets import Dataset, DatasetDict, IterableDataset, load_dataset
 from huggingface_hub import hf_hub_download
@@ -30,6 +32,10 @@ from sae_lens.config import (
 )
 from sae_lens.sae import SAE
 from sae_lens.tokenization_and_batching import concat_and_batch_sequences
+from sae_lens.training.arrow_dataset import ArrowDataset
+
+
+USE_DATASETS = False
 
 
 # TODO: Make an activation store config class to be consistent with the rest of the code.
@@ -377,14 +383,26 @@ class ActivationsStore:
 
         # ---
         # Actual code
-        activations_dataset = datasets.load_from_disk(self.cached_activations_path)
-        activations_dataset.set_format(
-            type="torch", columns=[self.hook_name], device=self.device, dtype=self.dtype
-        )
-        self.current_row_idx = 0  # idx to load next batch from
-        # ---
+        if USE_DATASETS:
+            activations_dataset = datasets.load_from_disk(self.cached_activations_path)
+            activations_dataset.set_format(
+                type="torch", columns=[self.hook_name], device=self.device, dtype=self.dtype
+            )
+            # ---
 
-        assert isinstance(activations_dataset, Dataset)
+            assert isinstance(activations_dataset, Dataset)
+        else:
+            # use PyArrow directly
+
+            activations_dataset = ArrowDataset(
+                self.cached_activations_path,
+                columns=[self.hook_name],
+                device=self.device,
+                dtype=self.dtype,
+                assume_equal_splits=True,
+            )
+
+        self.current_row_idx = 0  # idx to load next batch from
 
         # multiple in hooks future
         if not set([self.hook_name]).issubset(activations_dataset.column_names):
@@ -392,12 +410,17 @@ class ActivationsStore:
                 f"loaded dataset does not include hook activations, got {activations_dataset.column_names}"
             )
 
-        if activations_dataset.features[self.hook_name].shape != (
+        if USE_DATASETS:
+            shape = activations_dataset[self.hook_name].shape
+        else:
+            shape = activations_dataset.columns[self.hook_name]['shape']
+
+        if shape != (
             self.context_size_out,
             self.d_in,
         ):
             raise ValueError(
-                f"Given dataset of shape {activations_dataset.features[self.hook_name].shape} does not match context_size_out ({self.context_size_out}) and d_in ({self.d_in})"
+                f"Given dataset of shape {shape} does not match context_size_out ({self.context_size_out}) and d_in ({self.d_in})"
             )
 
         return activations_dataset
@@ -611,10 +634,15 @@ class ActivationsStore:
         new_buffer = []
         for hook_name in hook_names:
             # Load activations for each hook.
-            # Usually faster to first slice dataset then pick column
-            _hook_buffer = self.cached_activation_dataset[
-                self.current_row_idx : self.current_row_idx + total_size
-            ][hook_name]
+            if USE_DATASETS:
+                # Usually faster to first slice dataset then pick column
+                _hook_buffer = self.cached_activation_dataset[
+                    self.current_row_idx : self.current_row_idx + total_size
+                ][hook_name]
+            else:
+                _hook_buffer = self.cached_activation_dataset[
+                    hook_name, self.current_row_idx : self.current_row_idx + total_size
+                ]
             assert _hook_buffer.shape == (total_size, context_size_out, d_in)
             new_buffer.append(_hook_buffer)
 
